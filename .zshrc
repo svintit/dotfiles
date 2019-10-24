@@ -122,6 +122,10 @@ alias half="redshift -b 0.5"
 alias project='cd ~/Dropbox/2019-ca400-svintit2'
 alias tmux='TERM=screen-256color-bce tmux'
 alias l='$(fc -ln -1)'
+alias python='python3'
+alias pip='pip3'
+alias dotfiles='/usr/bin/git --git-dir=/home/traian/.dotfiles/ --work-tree=/home/traian'
+alias whereis='geoiplookup'
 
 # tmux new-session -A
 # if [ -z "$TMUX" ]; then
@@ -157,4 +161,3 @@ echo ""
 export TERM=xterm-color
 
 unsetopt PROMPT_SP
-alias dotfiles='/usr/bin/git --git-dir=/home/traian/.dotfiles/ --work-tree=/home/traian'

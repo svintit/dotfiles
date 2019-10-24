@@ -4,14 +4,44 @@
 
 module.exports = {
   config: {
-		  summon: {
-      	hideDock: true,
-      	hideOnBlur: false,
-      	hotkey: 'Alt+T'
+	hyperTabs: {
+		tabIconsColored: true,
+		activityColor: 'salmon',
+		closeAlign: 'right'
     	},
-    	hyperBorder: {
+ 
+    summon: {
+        hideDock: true,
+        hideOnBlur: false,
+        hotkey: 'Alt+T'
+    },
+    hyperBorder: {
         borderWidth: '5px'
-      },
+    },
+    paneNavigation: {
+        debug: false,
+        hotkeys: {
+            navigation: {
+                up: 'alt+k',
+                down: 'alt+j',
+                left: 'alt+h',
+                right: 'alt+l'
+            },
+            jump_prefix: 'ctrl+alt', // completed with 1-9 digits
+            permutation_modifier: 'shift', // Added to jump and navigation hotkeys for pane permutation
+            maximize: 'meta+enter'
+        },
+        showIndicators: true, // Show pane number
+        indicatorPrefix: '^⌥', // Will be completed with pane number
+        indicatorStyle: { // Added to indicator <div>
+            position: 'absolute',
+            top: 0,
+            left: 0,
+            fontSize: '15px'
+        },
+        focusOnMouseHover: false,
+        inactivePaneOpacity: 0.6 // Set to 1 to disable inactive panes dimming
+    },
     // choose either `'stable'` for receiving highly polished,
     // or `'canary'` for less polished but more frequent updates
     updateChannel: 'stable',
@@ -131,7 +161,7 @@ module.exports = {
 
     // if `true` (without backticks and without quotes), on right click selected text will be copied or pasted if no
     // selection is present (`true` by default on Windows and disables the context menu feature)
-    quickEdit: true,
+    quickEdit: false,
 
     // choose either `'vertical'`, if you want the column mode when Option key is hold during selection (Default)
     // or `'force'`, if you want to force selection regardless of whether the terminal is in mouse events mode
@@ -155,14 +185,15 @@ module.exports = {
   //   `@company/project`
   //   `project#1.0.1`
   plugins: [
-		'hyperterm-summon',
-		'hyperborder',
-		'hyperpower',
-		'hyper-yes',
-		'hyper-hide-scroll',
-		'hyper-hover-header',
-		'gitrocket',
-		'space-pull'
+                'hyperterm-summon',
+                'hyperborder',
+                'hyperpower',
+                'hyper-yes',
+                'hyper-hide-scroll',
+                'hyper-hover-header',
+                'gitrocket',
+                'hyper-pane',
+		'hyper-tabs-enhanced'
   ],
 
   // in development, you can create a directory under
@@ -173,9 +204,12 @@ module.exports = {
   keymaps: {
     // Example
     // 'window:devtools': 'cmd+alt+o',
-    "editor:copy":"Ctrl+C",
-    "editor:paste":"Ctrl+V",
-    "tab:new":"Ctrl+T",
-    "pane:close":"Ctrl+W"
+    "editor:copy":"ctrl+c",
+    "editor:paste":"ctrl+v",
+    "tab:new":"alt+n",
+    "pane:close":"alt+w",
+	"pane:splitVertical":'alt+i',
+	"pane:splitHorizontal": "alt+-",
+	"tab:jump:prefix": "alt"
   },
 };

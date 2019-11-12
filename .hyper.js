@@ -31,8 +31,8 @@ module.exports = {
             permutation_modifier: 'shift', // Added to jump and navigation hotkeys for pane permutation
             maximize: 'meta+enter'
         },
-        showIndicators: true, // Show pane number
-        indicatorPrefix: '^⌥', // Will be completed with pane number
+        showIndicators: false, // Show pane number
+        indicatorPrefix: '', // Will be completed with pane number
         indicatorStyle: { // Added to indicator <div>
             position: 'absolute',
             top: 0,
@@ -207,7 +207,7 @@ module.exports = {
     "editor:copy":"ctrl+c",
     "editor:paste":"ctrl+v",
     "tab:new":"alt+n",
-    "pane:close":"alt+w",
+    "pane:close":"alt+q",
 	"pane:splitVertical":'alt+i',
 	"pane:splitHorizontal": "alt+-",
 	"tab:jump:prefix": "alt"

@@ -8,12 +8,10 @@ export ZSH=$HOME/.oh-my-zsh
 # load a random theme each time oh-my-zsh is loaded, in which case,
 # to know which specific one was loaded, run: echo $RANDOM_THEME
 # See https://github.com/robbyrussell/oh-my-zsh/wiki/Themes
-# ZSH_THEME="refined"
-# ZSH_THEME="bira"
-# ZSH_THEME="random"
-ZSH_THEME="spaceship"
+# ZSH_THEME="spaceship"
+ZSH_THEME=""
 # Set list of themes to pick from when loading at random
-# Setting this variable when ZSH_THEME=random will cause zsh to load
+# Setting this variable when ZSH_THEME="spaceship"
 # a theme from this variable instead of looking in ~/.oh-my-zsh/themes/
 # If set to an empty array, this variable will have no effect.
 # ZSH_THEME_RANDOM_CANDIDATES=( "robbyrussell" "agnoster" )
@@ -115,8 +113,8 @@ alias tmks="tmux kill-server"
 alias telecom="ssh traian@pgc-32sx-1-z1"
 alias tm="tmux new-session -A"
 alias wd="ssh wdc4-tanker02"
-alias ls="colorls"
-alias ll="colorls -l"
+alias ls="colorls --gs"
+alias ll="colorls -l --gs"
 alias full="redshift -b 1.0"
 alias half="redshift -b 0.5"
 alias project='cd ~/Dropbox/2019-ca400-svintit2'
@@ -126,6 +124,7 @@ alias python='python3'
 alias pip='pip3'
 alias dotfiles='/usr/bin/git --git-dir=/home/traian/.dotfiles/ --work-tree=/home/traian'
 alias whereis='geoiplookup'
+alias vim='vim'
 
 # tmux new-session -A
 # if [ -z "$TMUX" ]; then
@@ -136,18 +135,29 @@ stty intr ^z
 
 cd() { builtin cd "$@" && ls; }
 
+..() { builtin cd .. && ls; }
+
 up() {
-	local d=""
-	limit=$1
-	for ((i=1 ; i <= limit ; i++))
-		do
-			d=$d/..
-		done
-	d=$(echo $d | sed 's/^\///')
-	if [ -z "$d" ]; then
-		d=..
-	fi
-	cd $d
+        local d=""
+        limit=$1
+        for ((i=1 ; i <= limit ; i++))
+            do
+                d=$d/..
+            done
+        d=$(echo $d | sed 's/^\///')
+        if [ -z "$d" ]; then
+            d=..
+        fi
+        cd $d
+}
+
+dip () {
+    docker_output_format='{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}  {{.Name}}  -> {{range $p, $conf := .Config.ExposedPorts}} {{$p}} {{end}}'
+    if [[ -n "$1" ]]; then
+        docker inspect --format="$docker_output_format" "$1"
+    else
+        docker ps -q --no-trunc | xargs docker inspect --format="$docker_output_format" | sort
+    fi
 }
 
 # neofetch --off
@@ -161,3 +171,8 @@ echo ""
 export TERM=xterm-color
 
 unsetopt PROMPT_SP
+fpath=($fpath "$HOME/.zfunctions")
+
+eval "$(starship init zsh)"
+# autoload -U promptinit; promptinit
+# prompt spaceship

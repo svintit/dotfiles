@@ -67,7 +67,7 @@ no <up> ddkP
 noremap <S-w> :w<cr>
 nnoremap <S-q> :q<cr>
 
-let g:indentLine_conceallevel=1
+let g:indentLine_conceallevel=0
 
 imap <C-j> <ESC>ji
 imap <C-h> <ESC>hi

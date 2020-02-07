@@ -77,8 +77,6 @@ imap <C-L> <ESC>A
 imap <C-space> <ESC>
 vmap <C-space> <ESC>
 
-set relativenumber
-
 set laststatus=2
 let g:dracula_colorterm = 0
 

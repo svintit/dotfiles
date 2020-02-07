@@ -1,5 +1,6 @@
 # If you come from bash you might have to change your $PATH.
 # export PATH=$HOME/bin:/usr/local/bin:$PATH
+export PATH=$HOME/bin:/usr/local/bin:$PATH
 
 # Path to your oh-my-zsh installation.
 export ZSH=$HOME/.oh-my-zsh
@@ -113,8 +114,8 @@ alias tmks="tmux kill-server"
 alias telecom="ssh traian@pgc-32sx-1-z1"
 alias tm="tmux new-session -A"
 alias wd="ssh wdc4-tanker02"
-alias ls="colorls --gs"
-alias ll="colorls -l --gs"
+alias ls="colorls --gs --group-directories-first"
+alias ll="colorls -l --gs --group-directories-first"
 alias full="redshift -b 1.0"
 alias half="redshift -b 0.5"
 alias project='cd ~/Dropbox/2019-ca400-svintit2'
@@ -125,6 +126,7 @@ alias pip='pip3'
 alias dotfiles='/usr/bin/git --git-dir=/home/traian/.dotfiles/ --work-tree=/home/traian'
 alias whereis='geoiplookup'
 alias vim='vim'
+alias code='intellij-idea-community'
 
 # tmux new-session -A
 # if [ -z "$TMUX" ]; then
@@ -132,10 +134,6 @@ alias vim='vim'
 # xcfi
 
 stty intr ^z
-
-cd() { builtin cd "$@" && ls; }
-
-..() { builtin cd .. && ls; }
 
 up() {
         local d=""
@@ -150,6 +148,26 @@ up() {
         fi
         cd $d
 }
+
+function auto_pipenv_shell {
+    if [ ! -n "${PIPENV_ACTIVE+1}" ]; then
+        if [ -f "Pipfile" ] ; then
+            source "$(pipenv --venv)/bin/activate"
+            source ~/.zshrc
+        fi
+    fi
+}
+
+function cd {
+    builtin cd "$@"
+    auto_pipenv_shell
+    ls
+}
+
+# auto_pipenv_shell
+
+..() { builtin cd .. && ls }
+
 
 dip () {
     docker_output_format='{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}  {{.Name}}  -> {{range $p, $conf := .Config.ExposedPorts}} {{$p}} {{end}}'
@@ -176,3 +194,4 @@ fpath=($fpath "$HOME/.zfunctions")
 eval "$(starship init zsh)"
 # autoload -U promptinit; promptinit
 # prompt spaceship
+

@@ -5,6 +5,9 @@ export PATH=$HOME/bin:/usr/local/bin:$PATH
 # Path to your oh-my-zsh installation.
 export ZSH=$HOME/.oh-my-zsh
 
+LANG="en_US.UTF-8"; export LANG
+LC_ALL="en_US.UTF-8"; export LC_ALL
+
 # Set name of the theme to load --- if set to "random", it will
 # load a random theme each time oh-my-zsh is loaded, in which case,
 # to know which specific one was loaded, run: echo $RANDOM_THEME
@@ -127,6 +130,7 @@ alias dotfiles='/usr/bin/git --git-dir=/home/traian/.dotfiles/ --work-tree=/home
 alias whereis='geoiplookup'
 alias vim='vim'
 alias code='intellij-idea-community'
+alias d='deactivate'
 
 # tmux new-session -A
 # if [ -z "$TMUX" ]; then
@@ -149,22 +153,11 @@ up() {
         cd $d
 }
 
-function auto_pipenv_shell {
-    if [ ! -n "${PIPENV_ACTIVE+1}" ]; then
-        if [ -f "Pipfile" ] ; then
-            source "$(pipenv --venv)/bin/activate"
-            source ~/.zshrc
-        fi
-    fi
-}
-
 function cd {
     builtin cd "$@"
-    auto_pipenv_shell
+    source pipenv-ify_pip-tools.sh
     ls
 }
-
-# auto_pipenv_shell
 
 ..() { builtin cd .. && ls }
 

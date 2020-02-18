@@ -171,6 +171,15 @@ dip () {
     fi
 }
 
+git () {
+    if [[ $@ == "log" ]]; then
+        command git log --pretty=format:'%C(yellow)%h%C(reset) | %an | %ar | %C(cyan)%s%C(reset)%d' --topo-order --graph --decorate
+    else
+        command git "$@"
+    fi
+
+}
+
 # neofetch --off
 # fortune | cowsay -e -- -T \U\\ | sed -e 's/^/\t/' | lolcat
 echo ""

@@ -131,6 +131,8 @@ alias whereis='geoiplookup'
 alias vim='vim'
 alias code='intellij-idea-community'
 alias d='deactivate'
+alias dps='docker ps'
+alias show-spotify='wmctrl -i -a $(wmctrl -lx | grep spotify | cut "-d " -f1)'
 
 # tmux new-session -A
 # if [ -z "$TMUX" ]; then

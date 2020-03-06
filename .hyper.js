@@ -37,7 +37,7 @@ module.exports = {
             position: 'absolute',
             top: 0,
             left: 0,
-            fontSize: '15px'
+            fontSize: '16px'
         },
         focusOnMouseHover: false,
         inactivePaneOpacity: 0.6 // Set to 1 to disable inactive panes dimming
@@ -48,6 +48,8 @@ module.exports = {
 
     // default font size in pixels for all tabs
     fontSize: 15,
+
+    scrollback: 2147483647,
 
     // font family with optional fallbacks
     fontFamily: 'iosevka',

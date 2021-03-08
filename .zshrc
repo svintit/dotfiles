@@ -1,6 +1,8 @@
 # If you come from bash you might have to change your $PATH.
 # export PATH=$HOME/bin:/usr/local/bin:$PATH
+export GOPATH=$HOME/go/bin
 export PATH=$HOME/bin:/usr/local/bin:$PATH
+export PATH="${GOPATH}:$PATH"
 
 # Path to your oh-my-zsh installation.
 export ZSH=$HOME/.oh-my-zsh
@@ -73,6 +75,8 @@ plugins=(
   command-time
   zsh-autosuggestions
   git extract web-search yum git-extras docker vagrant
+  kubectl
+  cp
 )
 
 source $ZSH/oh-my-zsh.sh
@@ -90,7 +94,7 @@ ZSH_COMMAND_TIME_MSG="Execution time: %s sec"
 if [[ -n $SSH_CONNECTION ]]; then
   export EDITOR='vim'
 else
-  export EDITOR='mvim'
+  export EDITOR='vim'
 fi
 
 # Compilation flags
@@ -111,7 +115,7 @@ fi
 alias c="clear"
 alias vim="sudo vim"
 alias e="exit"
-alias rm="trash-put"
+alias rm="trash"
 alias tmk="tmux kill-session -a; tmux rename-session 1"
 alias tmks="tmux kill-server"
 alias telecom="ssh traian@pgc-32sx-1-z1"
@@ -125,7 +129,7 @@ alias project='cd ~/Dropbox/2019-ca400-svintit2'
 alias tmux='TERM=screen-256color-bce tmux'
 alias l='$(fc -ln -1)'
 alias python='python3'
-alias pip='pip3'
+# alias pip='pip3'
 alias dotfiles='/usr/bin/git --git-dir=/home/traian/.dotfiles/ --work-tree=/home/traian'
 alias whereis='geoiplookup'
 alias vim='vim'
@@ -133,13 +137,26 @@ alias code='intellij-idea-community'
 alias d='deactivate'
 alias dps='docker ps'
 alias show-spotify='wmctrl -i -a $(wmctrl -lx | grep spotify | cut "-d " -f1)'
+alias xonotic="open /Applications/Xonotic/Xonotic.app --args -basedir /Applications/Xonotic"
+alias ks="kubectl"
+alias mk="minikube"
+alias dc="docker-compose"
+alias docker-pull-latest="docker pull 841996891963.dkr.ecr.eu-west-1.amazonaws.com/calypsoai/vespr_train:dev; docker pull 841996891963.dkr.ecr.eu-west-1.amazonaws.com/calypsoai/vespr_backend:dev; docker pull 841996891963.dkr.ecr.eu-west-1.amazonaws.com/calypsoai/vespr_frontend:dev;"
+
 
 # tmux new-session -A
 # if [ -z "$TMUX" ]; then
 #	TERM=screen-256color-bce tmux attach || TERM=screen-256color-bce tmux
 # xcfi
 
-stty intr ^z
+# stty intr ^z
+
+function book-gym {
+    CURRENT_DIR=$pwd
+    builtin cd ~/Dev/Repos/my-repos/auto-booking-system
+    python3 -m auto_booking_system.__init__ &
+    cd $CURRENT_DIR
+}
 
 up() {
         local d=""
@@ -155,9 +172,19 @@ up() {
         cd $d
 }
 
+function auto_pipenv_shell {
+    if [[ "$VIRTUAL_ENV" == "" ]]; then
+        if [ -f "Pipfile" ] ; then
+            source "$(pipenv --venv)/bin/activate"
+            source ~/.zshrc
+        fi
+    fi
+}
+
 function cd {
     builtin cd "$@"
-    source pipenv-ify_pip-tools.sh
+    # source pipenv-ify_pip-tools.sh
+    auto_pipenv_shell
     ls
 }
 
@@ -182,13 +209,85 @@ git () {
 
 }
 
+npm-login () {
+    rm ~/.npmrc
+    aws codeartifact login --tool npm --domain calypsoai --repository vespr
+    sed -i.old '1s;^;@calypsoai:;' ~/.npmrc
+}
+
+retag () {
+    DEV=dev
+    LATEST=latest
+
+    if [ -z "$1" ]; then
+        printf "Please add repo name for commit to retag:\n"
+        read REPO
+    else
+        REPO=$1
+    fi
+    
+    if [ -z "$2" ]; then
+        printf "Please add SHA for commit to retag:\n"
+        read SHA
+    else
+        SHA=$2
+    fi
+
+    docker pull 841996891963.dkr.ecr.eu-west-1.amazonaws.com/calypsoai/$REPO:$SHA && \
+    docker tag 841996891963.dkr.ecr.eu-west-1.amazonaws.com/calypsoai/$REPO:$SHA \
+        841996891963.dkr.ecr.eu-west-1.amazonaws.com/calypsoai/$REPO:$DEV
+    # docker push 841996891963.dkr.ecr.eu-west-1.amazonaws.com/calypsoai/$REPO:$DEV
+}
+
+retag-local () {
+docker build -t 841996891963.dkr.ecr.eu-west-1.amazonaws.com/calypsoai/vespr_backend:dev ~/Dev/Repos/calypso/VESPR/vespr-portal/.;
+docker build -t 841996891963.dkr.ecr.eu-west-1.amazonaws.com/calypsoai/vespr_train:dev ~/Dev/Repos/calypso/VESPR/vespr-train/.;
+docker build -t 841996891963.dkr.ecr.eu-west-1.amazonaws.com/calypsoai/vespr_frontend:dev ~/Dev/Repos/calypso/VESPR/vespr-frontend/.;
+}
+retag-remote () {
+retag-local
+docker push 841996891963.dkr.ecr.eu-west-1.amazonaws.com/calypsoai/vespr_train:dev
+docker push 841996891963.dkr.ecr.eu-west-1.amazonaws.com/calypsoai/vespr_backend:dev
+docker push 841996891963.dkr.ecr.eu-west-1.amazonaws.com/calypsoai/vespr_frontend:dev
+}
+
+get_pod_name() {
+    kubectl get pods | grep "$1" | awk '{print $1}'
+}
+
+export ECR_REGISTRY=841996891963.dkr.ecr.eu-west-1.amazonaws.com
+
+git-squash () {
+    BRANCH=$(git branch --show-current)
+    [[ -z $1 ]] && 1="insert message here"
+
+    git reset $(git merge-base master $BRANCH)
+    git add -A
+    git commit -m "$1"
+}
+
+source /Users/traian/Dev/Repos/calypso/VESPR/vespr-installer/shell_completion
+vespr-dev () {
+    PATH="/Users/traian/Dev/Repos/calypso/VESPR/vespr-installer"
+
+    builtin cd $PATH
+
+    ./vinstall --local --chart vespr-mysql --chart vespr-keycloak --chart vespr-status-updater  --status-prefix traian && \
+        kubectl --namespace default port-forward "$(get_pod_name 'vespr-keycloak')" 8130:8310 && \
+        kubectl --namespace default port-forward "$(get_pod_name 'vespr-mysql')" 3306:3306
+}
+
+# source ~/aws_code_artifact_login pipenv >/dev/null 2>&1
+
+# precmd() { print "" }
+
 # neofetch --off
 # fortune | cowsay -e -- -T \U\\ | sed -e 's/^/\t/' | lolcat
-echo ""
-echo "---------------------------------------------------------" | lolcat
-fortune | lolcat
-echo "---------------------------------------------------------" | lolcat
-echo ""
+# echo ""
+# echo "---------------------------------------------------------" | lolcat
+# fortune | lolcat
+# echo "---------------------------------------------------------" | lolcat
+# echo ""
 
 export TERM=xterm-color
 
@@ -199,3 +298,11 @@ eval "$(starship init zsh)"
 # autoload -U promptinit; promptinit
 # prompt spaceship
 
+
+# added by travis gem
+[ ! -s /Users/traian/.travis/travis.sh ] || source /Users/traian/.travis/travis.sh
+
+export HELM_EXPERIMENTAL_OCI=1
+
+# Add RVM to PATH for scripting. Make sure this is the last PATH variable change.
+export PATH="$PATH:$HOME/.rvm/bin"

@@ -15,7 +15,7 @@ Plugin 'vim-airline/vim-airline'
 Plugin 'Yggdroot/indentLine'  
 Plugin 'scrooloose/nerdtree'
 Plugin 'nvie/vim-flake8'
-Plugin 'dracula/vim'
+Plugin 'hzchirs/vim-material'
 Plugin 'wikitopian/hardmode'
 call vundle#end()
 
@@ -69,24 +69,18 @@ nnoremap <S-q> :q<cr>
 
 let g:indentLine_conceallevel=0
 
-imap <C-j> <ESC>ji
-imap <C-h> <ESC>hi
-imap <C-k> <ESC>ki
-imap <C-l> <ESC>li
-imap <C-L> <ESC>A
-imap <C-space> <ESC>
-vmap <C-space> <ESC>
+imap jj <Esc>
 
 set laststatus=2
-let g:dracula_colorterm = 0
 
 set t_Co=256
-colorscheme dracula
 
+let g:material_style='oceanic'
+set background=dark
+colorscheme vim-material
 
 set termguicolors
 let g:rainbow_active = 1
-let g:airline_theme='dracula'
 
 let g:rainbow_conf = {
 	\	'guifgs': ['cyan', 'yellow', 'orange', 'firebrick'],

@@ -184,7 +184,7 @@ function auto_pipenv_shell {
 function cd {
     builtin cd "$@"
     # source pipenv-ify_pip-tools.sh
-    auto_pipenv_shell
+    # auto_pipenv_shell
     ls
 }
 
@@ -211,44 +211,19 @@ git () {
 
 npm-login () {
     rm ~/.npmrc
-    aws codeartifact login --tool npm --domain calypsoai --repository vespr
-    sed -i.old '1s;^;@calypsoai:;' ~/.npmrc
-}
-
-retag () {
-    DEV=dev
-    LATEST=latest
-
-    if [ -z "$1" ]; then
-        printf "Please add repo name for commit to retag:\n"
-        read REPO
-    else
-        REPO=$1
-    fi
-    
-    if [ -z "$2" ]; then
-        printf "Please add SHA for commit to retag:\n"
-        read SHA
-    else
-        SHA=$2
-    fi
-
-    docker pull 841996891963.dkr.ecr.eu-west-1.amazonaws.com/calypsoai/$REPO:$SHA && \
-    docker tag 841996891963.dkr.ecr.eu-west-1.amazonaws.com/calypsoai/$REPO:$SHA \
-        841996891963.dkr.ecr.eu-west-1.amazonaws.com/calypsoai/$REPO:$DEV
-    # docker push 841996891963.dkr.ecr.eu-west-1.amazonaws.com/calypsoai/$REPO:$DEV
-}
-
-retag-local () {
-docker build -t 841996891963.dkr.ecr.eu-west-1.amazonaws.com/calypsoai/vespr_backend:dev ~/Dev/Repos/calypso/VESPR/vespr-portal/.;
-docker build -t 841996891963.dkr.ecr.eu-west-1.amazonaws.com/calypsoai/vespr_train:dev ~/Dev/Repos/calypso/VESPR/vespr-train/.;
-docker build -t 841996891963.dkr.ecr.eu-west-1.amazonaws.com/calypsoai/vespr_frontend:dev ~/Dev/Repos/calypso/VESPR/vespr-frontend/.;
-}
-retag-remote () {
-retag-local
-docker push 841996891963.dkr.ecr.eu-west-1.amazonaws.com/calypsoai/vespr_train:dev
-docker push 841996891963.dkr.ecr.eu-west-1.amazonaws.com/calypsoai/vespr_backend:dev
-docker push 841996891963.dkr.ecr.eu-west-1.amazonaws.com/calypsoai/vespr_frontend:dev
+    # aws codeartifact login --tool npm --domain calypsoai --repository vespr
+    # sed -i.old '1s;^;@calypsoai:;' ~/.npmrc
+    TOKEN=$(aws codeartifact get-authorization-token \
+        --region eu-west-1 \
+        --domain calypsoai \
+        --domain-owner 841996891963 \
+        --query authorizationToken \
+        --output text)
+    DEV_ENDPOINT="https://calypsoai-841996891963.d.codeartifact.eu-west-1.amazonaws.com/npm/dev-vespr/"
+    npm config set @calypsoai:registry $DEV_ENDPOINT
+    npm config set ${DEV_ENDPOINT/https:/}:always-auth true
+    npm config set ${DEV_ENDPOINT/https:/}:_authToken=${TOKEN}
+    echo "Successfully logged in to dev-vespr npm registry"
 }
 
 get_pod_name() {
@@ -275,6 +250,21 @@ vespr-dev () {
     ./vinstall --local --chart vespr-mysql --chart vespr-keycloak --chart vespr-status-updater  --status-prefix traian && \
         kubectl --namespace default port-forward "$(get_pod_name 'vespr-keycloak')" 8130:8310 && \
         kubectl --namespace default port-forward "$(get_pod_name 'vespr-mysql')" 3306:3306
+}
+
+export ACCOUNT_MGMT_REGION=eu-west-1
+
+get_aws_secret() {
+  local secret_id=${1}
+  aws secretsmanager get-secret-value \
+      --region ${ACCOUNT_MGMT_REGION} \
+      --secret-id ${secret_id} \
+      --query SecretString \
+      --output text \
+      | jq -r 'to_entries | .[] | .key + "=" + .value'
+    if [ ${pipestatus[1]} -ne 0 ]; then
+        die "Could not fetch secret '${secret_id}' from AWS Secrets Manager in AWS account ${AWS_ACCOUNT_ID}, region ${ACCOUNT_MGMT_REGION}"
+    fi
 }
 
 # source ~/aws_code_artifact_login pipenv >/dev/null 2>&1

@@ -141,8 +141,6 @@ alias xonotic="open /Applications/Xonotic/Xonotic.app --args -basedir /Applicati
 alias ks="kubectl"
 alias mk="minikube"
 alias dc="docker-compose"
-alias docker-pull-latest="docker pull 841996891963.dkr.ecr.eu-west-1.amazonaws.com/calypsoai/vespr_train:dev; docker pull 841996891963.dkr.ecr.eu-west-1.amazonaws.com/calypsoai/vespr_backend:dev; docker pull 841996891963.dkr.ecr.eu-west-1.amazonaws.com/calypsoai/vespr_frontend:dev;"
-
 
 # tmux new-session -A
 # if [ -z "$TMUX" ]; then
@@ -211,16 +209,16 @@ git () {
 
 npm-login () {
     rm ~/.npmrc
-    # aws codeartifact login --tool npm --domain calypsoai --repository vespr
-    # sed -i.old '1s;^;@calypsoai:;' ~/.npmrc
+    # aws codeartifact login --tool npm --domain <> --repository vespr
+    # sed -i.old '1s;^;@<>:;' ~/.npmrc
     TOKEN=$(aws codeartifact get-authorization-token \
         --region eu-west-1 \
-        --domain calypsoai \
+        --domain <> \
         --domain-owner 841996891963 \
         --query authorizationToken \
         --output text)
-    DEV_ENDPOINT="https://calypsoai-841996891963.d.codeartifact.eu-west-1.amazonaws.com/npm/dev-vespr/"
-    npm config set @calypsoai:registry $DEV_ENDPOINT
+    DEV_ENDPOINT="https://<>-841996891963.d.codeartifact.eu-west-1.amazonaws.com/npm/dev-vespr/"
+    npm config set @<>:registry $DEV_ENDPOINT
     npm config set ${DEV_ENDPOINT/https:/}:always-auth true
     npm config set ${DEV_ENDPOINT/https:/}:_authToken=${TOKEN}
     echo "Successfully logged in to dev-vespr npm registry"
@@ -239,17 +237,6 @@ git-squash () {
     git reset $(git merge-base master $BRANCH)
     git add -A
     git commit -m "$1"
-}
-
-source /Users/traian/Dev/Repos/calypso/VESPR/vespr-installer/shell_completion
-vespr-dev () {
-    PATH="/Users/traian/Dev/Repos/calypso/VESPR/vespr-installer"
-
-    builtin cd $PATH
-
-    ./vinstall --local --chart vespr-mysql --chart vespr-keycloak --chart vespr-status-updater  --status-prefix traian && \
-        kubectl --namespace default port-forward "$(get_pod_name 'vespr-keycloak')" 8130:8310 && \
-        kubectl --namespace default port-forward "$(get_pod_name 'vespr-mysql')" 3306:3306
 }
 
 export ACCOUNT_MGMT_REGION=eu-west-1

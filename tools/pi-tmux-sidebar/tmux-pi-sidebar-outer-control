@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+OUTER_SOCKET="${PI_OUTER_TMUX_SOCKET:-pi-shell}"
+OUTER_SESSION="${PI_OUTER_TMUX_SESSION:-pi-shell}"
+OUTER_WINDOW="workspace"
+LAUNCHER="$HOME/.local/bin/tmux-pi-sidebar-outer"
+OUTER_TMUX_BIN="${OUTER_TMUX_BIN:-tmux}"
+
+outer() {
+  env -u TMUX "$OUTER_TMUX_BIN" -L "$OUTER_SOCKET" "$@"
+}
+
+
+mode=$(outer show-option -wqv -t "$OUTER_SESSION:$OUTER_WINDOW" @pi_outer_sidebar_mode)
+
+resize_sidebar() {
+  local sidebar_pane size
+  sidebar_pane=$(outer show-option -wqv -t "$OUTER_SESSION:$OUTER_WINDOW" @pi_outer_sidebar_pane)
+  [ -n "$sidebar_pane" ] || return 0
+  if [ "$mode" = "collapsed" ]; then
+    size=10
+  else
+    size=53
+  fi
+  outer resize-pane -t "$sidebar_pane" -x "$size"
+}
+
+forward_mouse() {
+  local scope=${1:?scope required} button=${2:?button required}
+  local x=${3:?x required} y=${4:?y required} target sequence
+  if [ "$scope" = "sidebar" ]; then
+    target=$(outer show-option -wqv -t "$OUTER_SESSION:$OUTER_WINDOW" @pi_outer_sidebar_pane)
+  else
+    target=$(outer show-option -wqv -t "$OUTER_SESSION:$OUTER_WINDOW" @pi_outer_inner_pane)
+  fi
+  [ -n "$target" ] || return 0
+  x=$((x + 1))
+  y=$((y + 1))
+  printf -v sequence '\033[<%s;%s;%sM' "$button" "$x" "$y"
+  outer send-keys -t "$target" -l "$sequence" 2>/dev/null || true
+  if [ "$scope" = "sidebar" ]; then
+    target=$(outer show-option -wqv -t "$OUTER_SESSION:$OUTER_WINDOW" @pi_outer_inner_pane)
+    [ -n "$target" ] || return 0
+    outer select-pane -t "$target" 2>/dev/null || true
+  fi
+}
+
+set_focus_state() {
+  local state=${1:?state required} inner_pane pane_pid wrapper_pid client_pid
+  inner_pane=$(outer show-option -wqv -t "$OUTER_SESSION:$OUTER_WINDOW" @pi_outer_inner_pane)
+  pane_pid=$(outer display-message -p -t "$inner_pane" '#{pane_pid}')
+  wrapper_pid=$(pgrep -P "$pane_pid" | awk 'NR == 1 { print; exit }')
+  client_pid=$(pgrep -P "$wrapper_pid" | awk 'NR == 1 { print; exit }')
+  [[ "$client_pid" =~ ^[0-9]+$ ]] || return 0
+  if [ "$state" = "out" ]; then
+    kill -STOP "$client_pid" 2>/dev/null || true
+  else
+    kill -CONT "$client_pid" 2>/dev/null || true
+    outer refresh-client -S
+  fi
+}
+
+cmd=${1:-toggle}
+case "$cmd" in
+  toggle)
+    if [ "$mode" = "collapsed" ]; then
+      "$LAUNCHER" sidebar expanded
+    else
+      "$LAUNCHER" sidebar collapsed
+    fi
+    ;;
+  show|expand)
+    "$LAUNCHER" sidebar expanded
+    ;;
+  collapse)
+    "$LAUNCHER" sidebar collapsed
+    ;;
+  resize)
+    resize_sidebar
+    ;;
+  mouse)
+    forward_mouse "${2:-}" "${3:-}" "${4:-}" "${5:-}"
+    ;;
+  focus)
+    set_focus_state "${2:-}"
+    ;;
+  *)
+    echo "Usage: tmux-pi-sidebar-outer-control [toggle|show|expand|collapse|resize|mouse scope button x y|focus in|focus out]" >&2
+    exit 2
+    ;;
+esac

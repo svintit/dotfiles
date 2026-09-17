@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+DIR=${1:?direction required}
+GAP_TITLE="__gap__"
+CURRENT_PANE=$(tmux display-message -p '#{pane_id}')
+
+case "$DIR" in
+  L|R|U|D) ;;
+  *)
+    echo "Invalid direction: $DIR" >&2
+    exit 1
+    ;;
+esac
+
+if ! tmux select-pane -"$DIR" 2>/dev/null; then
+  exit 0
+fi
+
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  TITLE=$(tmux display-message -p '#{pane_title}')
+  if [ "$TITLE" != "$GAP_TITLE" ]; then
+    exit 0
+  fi
+  if ! tmux select-pane -"$DIR" 2>/dev/null; then
+    tmux select-pane -t "$CURRENT_PANE"
+    exit 0
+  fi
+done
+
+tmux select-pane -t "$CURRENT_PANE"

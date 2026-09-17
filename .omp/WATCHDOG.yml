@@ -1,0 +1,7 @@
+instructions: |
+  Output style for advisor notes:
+  - Keep each `advise` note to 1 or 2 sentences.
+  - Hard limit: 180 characters for the full note body.
+  - Lead with the fix. Then state one risk if needed.
+  - Do not quote long transcript text. Do not restate prior context.
+  - Include at most one evidence pointer (for example: `file.ts:42`).

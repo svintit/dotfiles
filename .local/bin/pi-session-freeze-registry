@@ -1,0 +1,112 @@
+#!/usr/bin/env python3
+import argparse
+import fcntl
+import json
+import os
+import tempfile
+from pathlib import Path
+
+STATE_HOME = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state"))
+STATE_DIR = STATE_HOME / "pi-session-freezer"
+STATE_FILE = STATE_DIR / "frozen-sessions.json"
+LOCK_FILE = STATE_DIR / "frozen-sessions.lock"
+
+
+def load_state():
+    try:
+        data = json.loads(STATE_FILE.read_text())
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        data = {}
+    sessions = data.get("sessions")
+    return {"version": 1, "sessions": sessions if isinstance(sessions, dict) else {}}
+
+
+def save_state(state):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    fd, temp_path = tempfile.mkstemp(prefix="frozen-sessions.", suffix=".json", dir=STATE_DIR)
+    try:
+        with os.fdopen(fd, "w") as handle:
+            json.dump(state, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, STATE_FILE)
+    finally:
+        try:
+            os.unlink(temp_path)
+        except FileNotFoundError:
+            pass
+
+
+def normalize(value):
+    return " ".join((value or "").lower().split())
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    freeze = subparsers.add_parser("freeze")
+    freeze.add_argument("session_id")
+    freeze.add_argument("--cwd", default="")
+    freeze.add_argument("--title", default="")
+    freeze.add_argument("--at", type=int, required=True)
+
+    thaw = subparsers.add_parser("thaw")
+    thaw.add_argument("session_id")
+
+    get = subparsers.add_parser("get")
+    get.add_argument("session_id")
+
+    frozen = subparsers.add_parser("is-frozen")
+    frozen.add_argument("session_id")
+
+    find_title = subparsers.add_parser("find-title")
+    find_title.add_argument("title")
+
+    subparsers.add_parser("list")
+    args = parser.parse_args()
+
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    with LOCK_FILE.open("a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        state = load_state()
+        sessions = state["sessions"]
+
+        if args.command == "freeze":
+            sessions[args.session_id] = {
+                "cwd": args.cwd,
+                "frozenAt": args.at,
+                "title": args.title,
+            }
+            save_state(state)
+            return 0
+        if args.command == "thaw":
+            if sessions.pop(args.session_id, None) is not None:
+                save_state(state)
+            return 0
+        if args.command == "get":
+            record = sessions.get(args.session_id)
+            if record is None:
+                return 1
+            print(json.dumps(record, separators=(",", ":")))
+            return 0
+        if args.command == "is-frozen":
+            return 0 if args.session_id in sessions else 1
+        if args.command == "find-title":
+            wanted = normalize(args.title)
+            matches = [
+                (record.get("frozenAt", 0), session_id)
+                for session_id, record in sessions.items()
+                if normalize(record.get("title", "")) == wanted
+            ]
+            if not matches:
+                return 1
+            print(max(matches)[1])
+            return 0
+        print(json.dumps(state, indent=2, sort_keys=True))
+        return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

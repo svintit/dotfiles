@@ -1,0 +1,74 @@
+--- a/quantum/qmk_settings.c
++++ b/quantum/qmk_settings.c
+@@ -285,20 +285,37 @@
+     return 0;
+ }
+
++static bool is_miryoku_typing_key(uint16_t keycode) {
++    switch (keycode) {
++        case LGUI_T(KC_A):
++        case LALT_T(KC_R):
++        case LCTL_T(KC_S):
++        case LSFT_T(KC_T):
++        case RGUI_T(KC_O):
++        case RALT_T(KC_I):
++        case RCTL_T(KC_E):
++        case RSFT_T(KC_N):
++        case LT(4, KC_Z):
++            return true;
++        default:
++            return false;
++    }
++}
++
+ uint16_t qs_get_tapping_term(uint16_t keycode, keyrecord_t *record) {
+-    return QS.tapping_term;
++    return is_miryoku_typing_key(keycode) ? 250 : QS.tapping_term;
+ }
+
+ bool get_permissive_hold(uint16_t keycode, keyrecord_t *record) {
+-    return QS_tapping_permissive_hold;
++    return !is_miryoku_typing_key(keycode) && QS_tapping_permissive_hold;
+ }
+
+ bool get_hold_on_other_key_press(uint16_t keycode, keyrecord_t *record) {
+-    return QS_tapping_hold_on_other_key_press;
++    return !is_miryoku_typing_key(keycode) && (keycode == LT(6, KC_DELETE) || QS_tapping_hold_on_other_key_press);
+ }
+
+ uint16_t get_quick_tap_term(uint16_t keycode, keyrecord_t *record) {
+-    return QS.quick_tap_term;
++    return is_miryoku_typing_key(keycode) || keycode == LT(6, KC_DELETE) ? 0 : QS.quick_tap_term;
+ }
+
+ bool get_retro_tapping(uint16_t keycode, keyrecord_t *record) {
+@@ -332,16 +349,19 @@
+     return QS_auto_shift_no_auto_repeat;
+ }
+
+-bool get_chordal_hold(uint16_t tap_hold_keycode, keyrecord_t* tap_hold_record,
+-                      uint16_t other_keycode, keyrecord_t* other_record) {
+-    if (QS_tapping_chordal_hold)
+-        return get_chordal_hold_default(tap_hold_record, other_record);
+-    return true;
++bool get_chordal_hold(uint16_t tap_hold_keycode, keyrecord_t *tap_hold_record, uint16_t other_keycode, keyrecord_t *other_record) {
++    if (!QS_tapping_chordal_hold) {
++        return true;
++    }
++    if (is_miryoku_typing_key(tap_hold_keycode) && other_record->event.type == KEY_EVENT && (other_record->event.key.row == 3 || other_record->event.key.row == 7) && other_record->event.key.col >= 3 && other_record->event.key.col <= 5) {
++        return false;
++    }
++    return get_chordal_hold_default(tap_hold_record, other_record);
+ }
+
+ uint16_t get_flow_tap_term(uint16_t keycode, keyrecord_t *record, uint16_t prev_keycode) {
+-    if (is_flow_tap_key(keycode) && is_flow_tap_key(prev_keycode)) {
+-        return QS.flow_tap_term;
+-    }
+-    return 0;
+-}
++    if (is_miryoku_typing_key(keycode) && is_flow_tap_key(keycode) && is_flow_tap_key(prev_keycode)) {
++        return 150;
++    }
++    return 0;
++}

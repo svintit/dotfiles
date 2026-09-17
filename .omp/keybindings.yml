@@ -1,0 +1,4 @@
+app.message.followUp:
+  - alt+enter
+  - ctrl+q
+  - ctrl+enter

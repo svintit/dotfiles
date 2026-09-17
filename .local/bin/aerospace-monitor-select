@@ -1,0 +1,22 @@
+#!/bin/sh
+
+AEROSPACE=/opt/homebrew/bin/aerospace
+HS=/Applications/Hammerspoon.app/Contents/Frameworks/hs/hs
+STATE="$HOME/.hammerspoon/workspace-selected-monitor"
+direction="$1"
+
+case "$direction" in
+    current) ;;
+    left|right|up|down|next|prev)
+        "$AEROSPACE" focus-monitor "$direction" >/dev/null 2>&1 || exit 1
+        ;;
+    *) exit 2 ;;
+esac
+
+selected="$($AEROSPACE list-workspaces --focused --format '%{monitor-name}|%{monitor-id}')"
+[ -n "$selected" ] || exit 1
+
+printf '%s\n' "$selected" > "$STATE.tmp" && mv "$STATE.tmp" "$STATE"
+
+"$HS" -q -t 1 -c 'local f=io.open(hs.configdir.."/workspace-selected-monitor","r"); local selected=f and f:read("*l"); if f then f:close() end; local name=selected and selected:match("^([^|]+)"); if _G.workspaceIndicator then _G.workspaceIndicator.selectMonitor(name) end; if _G.refreshBorderForWorkspace then _G.refreshBorderForWorkspace() end' \
+    </dev/null >/dev/null 2>&1 &

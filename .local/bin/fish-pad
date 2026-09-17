@@ -1,0 +1,429 @@
+#!/usr/bin/env python3
+"""fish-pad: PTY wrapper that adds symmetric margins to any terminal program.
+
+Runs a program inside a PTY with reduced width (cols - 2*hmargin) and height
+(rows - vmargin), then shifts all output right by hmargin columns and down by
+vmargin rows. Works with fish, pi, omp, vim, less, fzf, and other TUIs.
+
+Usage: fish-pad <hmargin>[:<vmargin>] [command...]
+  fish-pad 3              # 3-col horizontal margins, run fish
+  fish-pad 3:1 pi         # 3-col h-margin, 1-row top pad, run pi
+  fish-pad 3:1 omp        # same margins, run omp
+
+tmux integration:
+    set -g default-command "~/.local/bin/fish-pad 3"
+
+Limitations:
+- SGR mouse coordinates (mode 1006) are adjusted for margins. Older mouse
+  modes (X10/urxvt) are not adjusted.
+- Screen-clearing sequences (CSI 2J) erase the top padding area; the blank
+  lines are visually identical so this is cosmetic only.
+"""
+
+import os
+import pty
+import select
+import signal
+import struct
+import fcntl
+import termios
+import sys
+import errno
+
+
+class OutputTransformer:
+    """Shift terminal output right by hmargin columns and down by vmargin rows.
+
+    Tracks cursor column to detect PTY auto-wrap and insert margin on wrap.
+    Transforms absolute cursor positioning (CHA, CUP, CNL, CPL, HVP, VPA) to
+    account for the margin offset.
+    """
+
+    def __init__(self, hmargin, inner_cols, vmargin=0, total_rows=0):
+        self.hmargin = hmargin
+        self.vmargin = vmargin
+        self.inner_cols = inner_cols
+        self.total_rows = total_rows
+        self.pending = bytearray()
+        self.col = 0  # 0-based cursor column in the child's terminal
+
+    def set_inner_cols(self, cols):
+        self.inner_cols = cols
+
+    def set_total_rows(self, rows):
+        self.total_rows = rows
+
+    def transform(self, data):
+        if self.hmargin <= 0:
+            return data
+        if self.pending:
+            data = bytes(self.pending) + data
+            self.pending = bytearray()
+
+        m = b' ' * self.hmargin
+        out = bytearray()
+        i = 0
+        n = len(data)
+        col = self.col
+
+        while i < n:
+            b = data[i]
+
+            if b == 0x0d:  # \r - carriage return
+                out.append(b)
+                out.extend(m)
+                col = 0
+                i += 1
+            elif b == 0x0a:  # \n - line feed (cursor down, same column)
+                out.append(b)
+                i += 1
+            elif b == 0x08:  # \b - backspace
+                out.append(b)
+                if col > 0:
+                    col -= 1
+                i += 1
+            elif b == 0x09:  # \t - tab (simplified: advance to next 8-col stop)
+                out.append(b)
+                col = (col // 8 + 1) * 8
+                if col >= self.inner_cols:
+                    col = self.inner_cols - 1
+                i += 1
+            elif (b < 0x20 and b != 0x1b) or b == 0x7f:  # other control chars (ESC handled below)
+                out.append(b)
+                i += 1
+            elif b == 0x1b:  # ESC
+                if i + 1 >= n:
+                    self.pending.extend(data[i:])
+                    break
+                nxt = data[i + 1]
+                if nxt != 0x5b:  # not CSI
+                    # Handle OSC (ESC ]) which ends with BEL or ST
+                    if nxt == 0x5d:  # OSC
+                        j = i + 2
+                        while j < n:
+                            if data[j] == 0x07:  # BEL terminator
+                                j += 1
+                                break
+                            if data[j] == 0x1b and j + 1 < n and data[j + 1] == 0x5c:  # ST
+                                j += 2
+                                break
+                            if data[j] == 0x1b and j + 1 >= n:
+                                self.pending.extend(data[i:])
+                                break
+                            j += 1
+                        else:
+                            self.pending.extend(data[i:])
+                            break
+                        out.extend(data[i:j])
+                        i = j
+                        continue
+                    # Other 2-char escape (e.g., ESC ( B, ESC =, ESC >)
+                    out.append(b)
+                    out.append(nxt)
+                    i += 2
+                    continue
+                # CSI: ESC [ params intermediates final
+                j = i + 2
+                while j < n and 0x30 <= data[j] <= 0x3f:
+                    j += 1
+                while j < n and 0x20 <= data[j] <= 0x2f:
+                    j += 1
+                if j >= n:
+                    self.pending.extend(data[i:])
+                    break
+                final = data[j]
+                params = data[i + 2:j]
+
+                if final == 0x47:  # G - CHA (cursor horizontal absolute)
+                    num = int(params) if params else 1
+                    out.extend(f'\x1b[{num + self.hmargin}G'.encode())
+                    col = num - 1  # 0-based
+                elif final == 0x48:  # H - CUP (cursor position)
+                    s = params.decode('ascii', errors='replace')
+                    if ';' in s:
+                        row_s, col_s = s.split(';', 1)
+                        row_num = int(row_s) if row_s else 1
+                        col_num = int(col_s) if col_s else 1
+                        out.extend(f'\x1b[{row_num + self.vmargin};{col_num + self.hmargin}H'.encode())
+                        col = col_num - 1
+                    elif s:
+                        row_num = int(s)
+                        out.extend(f'\x1b[{row_num + self.vmargin};{1 + self.hmargin}H'.encode())
+                        col = 0
+                    else:
+                        out.extend(f'\x1b[{1 + self.vmargin};{1 + self.hmargin}H'.encode())
+                        col = 0
+                elif final == 0x66:  # f - HVP (same as CUP)
+                    s = params.decode('ascii', errors='replace')
+                    if ';' in s:
+                        row_s, col_s = s.split(';', 1)
+                        row_num = int(row_s) if row_s else 1
+                        col_num = int(col_s) if col_s else 1
+                        out.extend(f'\x1b[{row_num + self.vmargin};{col_num + self.hmargin}f'.encode())
+                        col = col_num - 1
+                    else:
+                        out.extend(f'\x1b[{1 + self.vmargin};{1 + self.hmargin}f'.encode())
+                        col = 0
+                elif final == 0x64:  # d - VPA (vertical position absolute)
+                    num = int(params) if params else 1
+                    out.extend(f'\x1b[{num + self.vmargin}d'.encode())
+                elif final == 0x45:  # E - CNL (cursor next line, to col 1)
+                    num = int(params) if params else 1
+                    out.extend(f'\x1b[{num}B'.encode())
+                    out.append(0x0d)
+                    out.extend(m)
+                    col = 0
+                elif final == 0x46:  # F - CPL (cursor prev line, to col 1)
+                    num = int(params) if params else 1
+                    out.extend(f'\x1b[{num}A'.encode())
+                    out.append(0x0d)
+                    out.extend(m)
+                    col = 0
+                elif final == 0x43:  # C - CUF (cursor forward)
+                    num = int(params) if params else 1
+                    out.extend(data[i:j + 1])
+                    col += num
+                elif final == 0x44:  # D - CUB (cursor backward)
+                    num = int(params) if params else 1
+                    out.extend(data[i:j + 1])
+                    col = max(0, col - num)
+                elif final == 0x60:  # ` - GCH (horizontal tab)
+                    out.extend(data[i:j + 1])
+                elif (final == 0x6c and params[:1] == b'?'
+                      and params[1:] in (b'1049', b'1047', b'47')
+                      and self.vmargin > 0):
+                    # Leaving the alternate screen resets the primary buffer's
+                    # scroll region. Re-assert the reserved top rows right here,
+                    # before the child redraws, so the next scroll cannot push
+                    # content into row 1. The region alone keeps the row blank -
+                    # nothing is cleared or injected into the content.
+                    out.extend(data[i:j + 1])
+                    out.extend(f'\x1b[{1 + self.vmargin};{self.total_rows}r'.encode())
+                else:
+                    out.extend(data[i:j + 1])
+                i = j + 1
+            else:
+                # Printable byte. Auto-wrap insertion was removed here: it
+                # miscounted wide glyphs (powerline, braille) and corrupted
+                # full-screen TUI redraws (line duplication). TUIs position
+                # every line with absolute cursor moves, translated above, so
+                # they never rely on this. Over-long unbroken lines wrap at the
+                # real terminal width without a left margin (cosmetic only).
+                out.append(b)
+                # Only advance column on ASCII or UTF-8 lead byte (>= 0xC0).
+                # Continuation bytes (0x80-0xBF) are part of the same character.
+                if b < 0x80 or b >= 0xC0:
+                    col += 1
+                i += 1
+
+        self.col = col
+        return bytes(out)
+
+
+class InputTransformer:
+    """Adjust terminal-to-shell responses for margin offset.
+
+    DSR replies (CSI row;col R) from tmux carry tmux's coordinates which
+    include the margins. Subtract hmargin from column and vmargin from row
+    so the child sees its own coordinates. Only complete CSI sequences in a
+    single read are rewritten. Incomplete sequences (including a lone ESC)
+    pass through immediately.
+    """
+
+    def __init__(self, hmargin, vmargin=0):
+        self.hmargin = hmargin
+        self.vmargin = vmargin
+
+    def transform(self, data):
+        if self.hmargin <= 0 and self.vmargin <= 0:
+            return data
+
+        out = bytearray()
+        i = 0
+        n = len(data)
+
+        while i < n:
+            b = data[i]
+            if b == 0x1b and i + 1 < n and data[i + 1] == 0x5b:
+                # CSI: parse params + final byte
+                j = i + 2
+                while j < n and 0x30 <= data[j] <= 0x3f:
+                    j += 1
+                while j < n and 0x20 <= data[j] <= 0x2f:
+                    j += 1
+                if j >= n:
+                    # Incomplete CSI - pass through raw, don't buffer
+                    out.extend(data[i:])
+                    break
+                final = data[j]
+                params = data[i + 2:j]
+
+                if final == 0x52:  # R - DSR cursor position report
+                    s = params.decode('ascii', errors='replace')
+                    if ';' in s:
+                        row_s, col_s = s.split(';', 1)
+                        row_num = int(row_s) if row_s else 1
+                        col_num = int(col_s) if col_s else 1
+                        row_num = max(1, row_num - self.vmargin)
+                        col_num = max(1, col_num - self.hmargin)
+                        out.extend(f'\x1b[{row_num};{col_num}R'.encode())
+                    else:
+                        out.extend(data[i:j + 1])
+                elif final in (0x4d, 0x6d) and params.startswith(b'<'):
+                    # SGR mouse: CSI <button;x;y M/m - adjust x,y for margins
+                    s = params[1:].decode('ascii', errors='replace')
+                    parts = s.split(';')
+                    if len(parts) == 3:
+                        btn = parts[0]
+                        x = max(1, int(parts[1]) - self.hmargin)
+                        y = max(1, int(parts[2]) - self.vmargin)
+                        out.extend(f'\x1b[<{btn};{x};{y}{chr(final)}'.encode())
+                    else:
+                        out.extend(data[i:j + 1])
+                else:
+                    out.extend(data[i:j + 1])
+                i = j + 1
+            else:
+                out.append(b)
+                i += 1
+
+        return bytes(out)
+
+
+def get_winsize(fd):
+    s = fcntl.ioctl(fd, termios.TIOCGWINSZ, b'\x00' * 8)
+    rows, cols = struct.unpack('HHHH', s)[:2]
+    return rows, cols
+
+
+def set_winsize(fd, rows, cols):
+    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack('HHHH', rows, cols, 0, 0))
+
+
+def main():
+    # Parse hmargin[:vmargin] from argv[1]; remaining args are the command.
+    spec = sys.argv[1] if len(sys.argv) > 1 else '1'
+    if ':' in spec:
+        h_s, v_s = spec.split(':', 1)
+        hmargin = int(h_s)
+        vmargin = int(v_s)
+    else:
+        hmargin = int(spec)
+        vmargin = 0
+    hmargin = max(0, hmargin)
+    vmargin = max(0, vmargin)
+    command = sys.argv[2:] if len(sys.argv) > 2 else None
+
+    rows, cols = get_winsize(0)
+    inner = max(cols - 2 * hmargin, 1)
+    inner_rows = max(rows - vmargin, 1)
+
+    master_fd, slave_fd = pty.openpty()
+    set_winsize(slave_fd, inner_rows, inner)
+
+    pid = os.fork()
+    if pid == 0:
+        # Child: set up slave PTY and exec the command (or fish).
+        os.setsid()
+        fcntl.ioctl(slave_fd, termios.TIOCSCTTY, 0)
+        os.dup2(slave_fd, 0)
+        os.dup2(slave_fd, 1)
+        os.dup2(slave_fd, 2)
+        if slave_fd > 2:
+            os.close(slave_fd)
+        os.close(master_fd)
+        os.environ['COLUMNS'] = str(inner)
+        os.environ['LINES'] = str(inner_rows)
+        if command:
+            os.execvp(command[0], command)
+        else:
+            shell = os.environ.get('SHELL', '/opt/homebrew/bin/fish')
+            if not os.path.exists(shell):
+                shell = '/bin/bash'
+            os.execvp(shell, [shell])
+        os._exit(127)
+
+    # Parent: relay with transformation
+    os.close(slave_fd)
+
+    # Raw mode on stdin (tmux PTY slave)
+    old_attrs = termios.tcgetattr(0)
+    raw = list(old_attrs)
+    raw[0] = 0   # iflag: no input processing
+    raw[1] = 0   # oflag: no output processing (no ONLCR)
+    raw[3] = 0   # lflag: no echo, no canonical, no signals
+    termios.tcsetattr(0, termios.TCSANOW, raw)
+
+    transformer = OutputTransformer(hmargin, inner, vmargin, total_rows=rows)
+    input_transformer = InputTransformer(hmargin, vmargin)
+
+    def on_winch(sig, frame):
+        r, c = get_winsize(0)
+        ic = max(c - 2 * hmargin, 1)
+        ir = max(r - vmargin, 1)
+        transformer.set_inner_cols(ic)
+        transformer.set_total_rows(r)
+        # A resize resets the region to full AND tmux reflow can pull a content
+        # line into the reserved rows. Re-assert the region, blank the reserved
+        # rows (they are the fixed top margin, so this only removes a reflow
+        # duplicate), then park the cursor inside the region. omp's forced
+        # repaint (triggered by the resize below) repositions from there.
+        if vmargin > 0:
+            seq = f'\x1b[{1 + vmargin};{r}r'.encode()
+            for row in range(1, vmargin + 1):
+                seq += f'\x1b[{row};1H\x1b[2K'.encode()
+            seq += f'\x1b[{1 + vmargin};1H'.encode()
+            os.write(1, seq)
+        set_winsize(master_fd, ir, ic)
+
+    signal.signal(signal.SIGWINCH, on_winch)
+
+    # Reserve the top vmargin rows with a scroll region (DECSTBM) so they stay
+    # blank even as the child scrolls its output, then position into the region
+    # and add the left margin.
+    if vmargin > 0:
+        os.write(1, f'\x1b[{1 + vmargin};{rows}r'.encode())
+        os.write(1, f'\x1b[{1 + vmargin};1H'.encode())
+    if hmargin > 0:
+        os.write(1, b' ' * hmargin)
+
+    try:
+        while True:
+            try:
+                r, _, _ = select.select([0, master_fd], [], [])
+            except select.error as e:
+                if e.args[0] == errno.EINTR:
+                    continue
+                raise
+
+            if 0 in r:
+                d = os.read(0, 65536)
+                if not d:
+                    break
+                os.write(master_fd, input_transformer.transform(d))
+
+            if master_fd in r:
+                try:
+                    d = os.read(master_fd, 65536)
+                except OSError:
+                    break
+                if not d:
+                    break
+                os.write(1, transformer.transform(d))
+    finally:
+        if vmargin > 0:
+            try:
+                os.write(1, b'\x1b[r')  # reset scroll region to full
+            except OSError:
+                pass
+        termios.tcsetattr(0, termios.TCSANOW, old_attrs)
+        try:
+            _, status = os.waitpid(pid, 0)
+            code = os.WEXITSTATUS(status) if os.WIFEXITED(status) else 1
+            sys.exit(code)
+        except OSError:
+            pass
+
+
+if __name__ == '__main__':
+    main()

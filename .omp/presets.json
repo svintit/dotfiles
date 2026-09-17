@@ -1,0 +1,39 @@
+{
+  "default": {
+    "provider": "fireworks",
+    "model": "glm-5p2-fast",
+    "thinkingLevel": "high",
+    "instructions": "You are in default mode. Make focused, correct changes. Read before editing, keep scope tight, and run targeted validation when practical."
+  },
+  "fast": {
+    "provider": "fireworks",
+    "model": "qwen3.7-plus",
+    "thinkingLevel": "low",
+    "instructions": "You are in fast mode. Prioritize speed and concise answers. Use tools only when needed."
+  },
+  "coding": {
+    "provider": "fireworks",
+    "model": "glm-5p2-fast",
+    "thinkingLevel": "high",
+    "instructions": "You are in coding mode. Make focused, correct changes. Read before editing, keep scope tight, and run targeted validation when practical."
+  },
+  "writing": {
+    "provider": "anthropic",
+    "model": "claude-fable-5",
+    "thinkingLevel": "medium",
+    "instructions": "You are in writing mode. Prioritize clear structure, concise wording, and natural human phrasing. Avoid long paragraphs."
+  },
+  "debugging": {
+    "provider": "openai",
+    "model": "gpt-5.6-sol",
+    "thinkingLevel": "xhigh",
+    "instructions": "You are in debugging mode. Diagnose before changing code. Gather evidence, isolate root cause, propose the smallest safe fix, and verify it."
+  },
+  "research": {
+    "provider": "anthropic",
+    "model": "claude-opus-4-8",
+    "thinkingLevel": "high",
+    "tools": ["read", "bash", "grep", "find", "ls"],
+    "instructions": "You are in research mode. Explore broadly, compare evidence, cite files or sources clearly, and avoid making code changes unless explicitly asked."
+  }
+}

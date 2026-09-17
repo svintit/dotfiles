@@ -1,0 +1,506 @@
+#!/bin/sh
+
+NEW_ROW='＋ <new session>'
+
+# Deterministic per-name starting colors, with per-list collision and similarity resolution.
+PALETTE='39 45 51 75 81 114 117 150 156 180 186 210 213 215 219 222 33 69 105 111 123 141 147 159 171 177 183 195 201 207 228 229'
+MIN_COLOUR_DISTANCE_SQUARED=$((140 * 140))
+palette_pick() {
+  h=${1:-0}
+  set -- $PALETTE
+  i=$(( h % $# + 1 ))
+  eval "printf '%s' \"\${$i}\""
+}
+
+xterm_colour_to_rgb() {
+  rgb_code=$1
+
+  if [ "$rgb_code" -ge 16 ] && [ "$rgb_code" -le 231 ]; then
+    rgb_offset=$((rgb_code - 16))
+    rgb_component=$((rgb_offset / 36))
+    if [ "$rgb_component" -eq 0 ]; then RGB_R=0; else RGB_R=$((55 + rgb_component * 40)); fi
+    rgb_component=$(((rgb_offset / 6) % 6))
+    if [ "$rgb_component" -eq 0 ]; then RGB_G=0; else RGB_G=$((55 + rgb_component * 40)); fi
+    rgb_component=$((rgb_offset % 6))
+    if [ "$rgb_component" -eq 0 ]; then RGB_B=0; else RGB_B=$((55 + rgb_component * 40)); fi
+    return
+  fi
+
+  if [ "$rgb_code" -ge 232 ] && [ "$rgb_code" -le 255 ]; then
+    RGB_R=$((8 + (rgb_code - 232) * 10))
+    RGB_G=$RGB_R
+    RGB_B=$RGB_R
+    return
+  fi
+
+  RGB_R=255
+  RGB_G=255
+  RGB_B=255
+}
+
+color_is_used() {
+  case " $used_codes " in
+    *" $1 "*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+colour_is_too_similar() {
+  similar_candidate=$1
+  similar_used=$2
+
+  xterm_colour_to_rgb "$similar_candidate"
+  similar_cr=$RGB_R
+  similar_cg=$RGB_G
+  similar_cb=$RGB_B
+
+  xterm_colour_to_rgb "$similar_used"
+  similar_ur=$RGB_R
+  similar_ug=$RGB_G
+  similar_ub=$RGB_B
+
+  similar_dr=$((similar_cr - similar_ur))
+  similar_dg=$((similar_cg - similar_ug))
+  similar_db=$((similar_cb - similar_ub))
+  similar_distance=$((similar_dr * similar_dr + similar_dg * similar_dg + similar_db * similar_db))
+
+  [ "$similar_distance" -lt "$MIN_COLOUR_DISTANCE_SQUARED" ]
+}
+
+colour_is_distinct() {
+  distinct_candidate=$1
+
+  color_is_used "$distinct_candidate" && return 1
+
+  for distinct_used in $used_codes; do
+    colour_is_too_similar "$distinct_candidate" "$distinct_used" && return 1
+  done
+
+  return 0
+}
+
+remember_colour() {
+  used_codes="${used_codes}${1} "
+  PICKED_COLOUR=$1
+}
+
+pick_unique_colour() {
+  pick_hash=${1:-0}
+  set -- $PALETTE
+  pick_count=$#
+  pick_start=$(( pick_hash % pick_count + 1 ))
+  pick_offset=0
+
+  while [ "$pick_offset" -lt "$pick_count" ]; do
+    pick_pos=$(( (pick_start + pick_offset - 1) % pick_count + 1 ))
+    eval "pick_candidate=\${$pick_pos}"
+    if colour_is_distinct "$pick_candidate"; then
+      remember_colour "$pick_candidate"
+      return
+    fi
+    pick_offset=$((pick_offset + 1))
+  done
+
+  pick_offset=0
+  while [ "$pick_offset" -lt "$pick_count" ]; do
+    pick_pos=$(( (pick_start + pick_offset - 1) % pick_count + 1 ))
+    eval "pick_candidate=\${$pick_pos}"
+    if ! color_is_used "$pick_candidate"; then
+      remember_colour "$pick_candidate"
+      return
+    fi
+    pick_offset=$((pick_offset + 1))
+  done
+
+  pick_candidate=16
+  while [ "$pick_candidate" -le 231 ]; do
+    if colour_is_distinct "$pick_candidate"; then
+      remember_colour "$pick_candidate"
+      return
+    fi
+    pick_candidate=$((pick_candidate + 1))
+  done
+
+  pick_candidate=16
+  while [ "$pick_candidate" -le 231 ]; do
+    if ! color_is_used "$pick_candidate"; then
+      remember_colour "$pick_candidate"
+      return
+    fi
+    pick_candidate=$((pick_candidate + 1))
+  done
+
+  PICKED_COLOUR=$(palette_pick "$pick_hash")
+}
+
+# Color whole session line; hash from the bare name so color is stable per name.
+# Resolve collisions and near-collisions inside the picker list.
+colorize_sessions() {
+  esc=$(printf '\033')
+  used_codes=' '
+  PICKED_COLOUR=''
+  while IFS= read -r line; do
+    name=$(printf '%s' "$line" | sed 's/^[^[:alnum:]_~/.+-]*//')
+    h=$(printf '%s' "$name" | cksum | cut -d' ' -f1)
+    pick_unique_colour "$h"
+    code=$PICKED_COLOUR
+    printf '%s[38;5;%sm%s%s[0m\n' "$esc" "$code" "$line" "$esc"
+  done
+}
+
+list_tmux_sessions_uncached() {
+  # Order by most-recently-attached, but swap the top two so the previously
+  # used session is the default selection (alt-tab style). Current lands 2nd.
+  tmux list-sessions -F '#{session_last_attached} #S' 2>/dev/null \
+    | sort -rn \
+    | sed 's/^[0-9]* //' \
+    | grep -Ev '^_' \
+    | awk 'NR==1{a=$0;next} NR==2{print;print a;next} {print} END{if(NR==1)print a}' \
+    | sed 's/^/ /' \
+    | colorize_sessions || true
+}
+
+CACHE_TTL=${SESH_TMUX_CACHE_TTL:-300}
+TMUX_CACHE_TTL=${SESH_TMUX_SESSION_CACHE_TTL:-2}
+CACHE_DIR=${SESH_TMUX_CACHE_DIR:-${TMPDIR:-/tmp}}
+
+cache_ttl() {
+  case "$1" in
+    tmux)
+      printf '%s' "$TMUX_CACHE_TTL"
+      ;;
+    *)
+      printf '%s' "$CACHE_TTL"
+      ;;
+  esac
+}
+
+cache_file() {
+  printf '%s/sesh-tmux-popup-%s.cache' "$CACHE_DIR" "$1"
+}
+
+cache_fresh() {
+  mode="$1"
+  file="$2"
+  [ -s "$file" ] || return 1
+
+  ttl=$(cache_ttl "$mode")
+  now=$(date +%s)
+  mtime=$(stat -f %m "$file" 2>/dev/null || stat -c %Y "$file" 2>/dev/null || printf '0')
+  [ $((now - mtime)) -lt "$ttl" ]
+}
+
+generate_sesh_cache() {
+  case "$1" in
+    tmux)
+      list_tmux_sessions_uncached
+      ;;
+    all_entries)
+      sesh list -z -c -i --hide-duplicates | grep -Ev '[[:space:]]_' || true
+      ;;
+    zoxide)
+      sesh list -z -i || true
+      ;;
+    config)
+      sesh list -c -i || true
+      ;;
+    json)
+      sesh list -j -t -z -c --hide-duplicates 2>/dev/null || printf '[]\n'
+      ;;
+  esac
+}
+
+refresh_cache() {
+  mode="$1"
+  file=$(cache_file "$mode")
+  tmp="$file.$$"
+
+  if generate_sesh_cache "$mode" > "$tmp" 2>/dev/null; then
+    mv "$tmp" "$file"
+  else
+    rm -f "$tmp"
+    return 1
+  fi
+}
+
+refresh_cache_bg() {
+  mode="$1"
+  lock="$(cache_file "$mode").lock"
+
+  (
+    if mkdir "$lock" 2>/dev/null; then
+      trap 'rmdir "$lock"' EXIT INT TERM
+      refresh_cache "$mode" >/dev/null 2>&1 || true
+    fi
+  ) >/dev/null 2>&1 &
+}
+
+cached_sesh() {
+  mode="$1"
+  file=$(cache_file "$mode")
+
+  if [ -s "$file" ]; then
+    cat "$file"
+  else
+    # Never block fzf startup on cache generation. The popup should appear with
+    # whatever is available, while the first Tab and tmux hooks keep this warm.
+    refresh_cache_bg "$mode"
+  fi
+}
+
+list_tmux_sessions() {
+  cached_sesh tmux
+}
+
+warm_caches() {
+  # This command is launched in the background from the first Tab press. Build
+  # the initial tmux list immediately, then let slower sesh sources refresh in
+  # parallel.
+  file=$(cache_file tmux)
+  if ! cache_fresh tmux "$file"; then
+    refresh_cache tmux >/dev/null 2>&1 || true
+  fi
+
+  for mode in all_entries zoxide config json; do
+    file=$(cache_file "$mode")
+    if ! cache_fresh "$mode" "$file"; then
+      refresh_cache_bg "$mode"
+    fi
+  done
+}
+
+list_sessions() {
+  case "$1" in
+    all)
+      cached_sesh tmux
+      cached_sesh all_entries
+      printf '%s\n' "$NEW_ROW"
+      ;;
+    tmux)
+      list_tmux_sessions
+      printf '%s\n' "$NEW_ROW"
+      ;;
+    zoxide)
+      cached_sesh zoxide
+      printf '%s\n' "$NEW_ROW"
+      ;;
+    config)
+      cached_sesh config
+      printf '%s\n' "$NEW_ROW"
+      ;;
+  esac
+}
+
+clean_item() {
+  esc=$(printf '\033')
+  printf '%s' "$1" | sed "s/${esc}\[[0-9;]*m//g; s/^[^[:alnum:]_~/.+-]*[[:space:]]*//"
+}
+
+close_popup() {
+  # Direct display-popup mode closes when this script exits. The old nested
+  # picker session still needs detach-client to close the popup client.
+  if [ "${SESH_TMUX_DIRECT_POPUP:-}" = "1" ]; then
+    return 0
+  fi
+
+  tmux detach-client 2>/dev/null || true
+}
+
+switch_target_to_session() {
+  session_name="$1"
+
+  if [ -n "${TMUX_TARGET_CLIENT:-}" ]; then
+    tmux switch-client -c "$TMUX_TARGET_CLIENT" -t "=$session_name" \; refresh-client -S
+  else
+    tmux switch-client -t "=$session_name" \; refresh-client -S
+  fi
+
+  refresh_cache_bg tmux
+  close_popup
+  exit 0
+}
+
+preview_item() {
+  item="$1"
+  clean="$(clean_item "$item")"
+
+  if [ "$item" = "$NEW_ROW" ]; then
+    printf 'Create a new tmux session in this directory:\n\n%s\n\nPress Enter, then type session name.' "$(pwd -P)"
+    return
+  fi
+
+  if tmux has-session -t "=$clean" 2>/dev/null; then
+    printf 'windows in %s\n\n' "$clean"
+    tmux list-windows -t "=$clean" -F '#{?window_active,▸, } #{window_index}: #{window_name}'
+    return
+  fi
+
+  path="$(cached_sesh json | jq -r --arg name "$clean" 'map(select(.Name == $name))[0].Path // empty')"
+  if [ -n "$path" ]; then
+    printf 'will create session: %s\n\npath: %s\n\n' "$clean" "$path"
+    if [ -d "$path" ]; then
+      printf 'directory\n'
+      ls -la "$path" 2>/dev/null | sed -n '1,30p'
+    fi
+    return
+  fi
+
+  sesh preview "$item"
+}
+
+delete_item() {
+  item="$1"
+  clean="$(clean_item "$item")"
+
+  if [ -z "$clean" ] || [ "$item" = "$NEW_ROW" ]; then
+    return 0
+  fi
+
+  session_name="$(printf '%s' "$clean" | tr ':' '-')"
+  if ! tmux has-session -t "=$session_name" 2>/dev/null; then
+    printf '\nOnly tmux sessions can be deleted here.\n' >/dev/tty
+    sleep 1
+    return 0
+  fi
+
+  attached="$(tmux display-message -p -t "=$session_name" '#{session_attached}' 2>/dev/null || printf '0')"
+  printf '\nKill tmux session "%s"? attached clients: %s [y/N] ' "$session_name" "${attached:-0}" >/dev/tty
+  IFS= read -r answer </dev/tty || return 0
+
+  case "$answer" in
+    y|Y|yes|YES)
+      tmux kill-session -t "=$session_name" 2>/dev/null || true
+      refresh_cache tmux >/dev/null 2>&1 || true
+      printf 'Killed %s\n' "$session_name" >/dev/tty
+      sleep 0.6
+      ;;
+    *)
+      printf 'Cancelled\n' >/dev/tty
+      sleep 0.4
+      ;;
+  esac
+}
+
+case "${1:-}" in
+  --warm)
+    warm_caches
+    exit 0
+    ;;
+  --refresh)
+    refresh_cache "${2:-tmux}"
+    exit 0
+    ;;
+  --list)
+    list_sessions "${2:-all}"
+    exit 0
+    ;;
+  --preview)
+    preview_item "${2:-}"
+    exit 0
+    ;;
+  --delete)
+    delete_item "${2:-}"
+    exit 0
+    ;;
+esac
+
+self="$0"
+fzf_colors='bg:#0a0c14,fg:#e0e0e0,hl:#ffcc66,bg+:#141420,fg+:#ffffff,hl+:#ffcc66,info:#5ed47a,prompt:#d4b4f0,pointer:#ff5c8d,marker:#5ed47a,spinner:#ffcc66,header:#5c5c7a,border:#5c5c7a,label:#ffcc66'
+close_bind='esc:abort,ctrl-c:abort'
+if [ -n "${SESH_TMUX_PICKER_SESSION:-}" ]; then
+  close_bind='esc:execute-silent(tmux detach-client -s "$SESH_TMUX_PICKER_SESSION"),ctrl-c:execute-silent(tmux detach-client -s "$SESH_TMUX_PICKER_SESSION")'
+fi
+main_footer=$(printf '\nEnter connect  ^p preview\n^x delete  ^z dirs  ^a all\n^g cfg  ^r reload')
+
+
+selected="$(list_sessions tmux | fzf \
+  --ansi \
+  --no-sort \
+  --layout=reverse \
+  --info=inline-right \
+  --border=rounded \
+  --border-label=' tmux ' \
+  --prompt=' 󰆍  ' \
+  --pointer='❯' \
+  --marker='✓' \
+  --footer-border=none \
+  --footer="$main_footer" \
+  --color="$fzf_colors" \
+  --bind="$close_bind,tab:down,btab:up,ctrl-p:toggle-preview,ctrl-r:reload($self --list tmux)" \
+  --bind="ctrl-x:execute($self --delete {})+reload($self --list tmux)" \
+  --bind="ctrl-t:change-prompt( 󰆍  )+change-border-label( tmux )+reload($self --list tmux)" \
+  --bind="ctrl-a:change-prompt( 󰓩  )+change-border-label( all )+reload($self --list all)" \
+  --bind="ctrl-z:change-prompt( 󰉋  )+change-border-label( directories )+reload($self --list zoxide)" \
+  --bind="ctrl-g:change-prompt(   )+change-border-label( config )+reload($self --list config)" \
+  --preview="$self --preview {}" \
+  --preview-window='hidden,right:55%,border-left,rounded')" || {
+  close_popup
+  exit 0
+}
+
+[ -n "$selected" ] || exit 0
+
+if [ "$selected" = "$NEW_ROW" ]; then
+  cwd="$(pwd -P)"
+  default_name="$(basename "$cwd" | tr ' :' '--')"
+  name="$(printf '%s\n' "$default_name" | fzf \
+    --no-sort \
+    --print-query \
+    --query="$default_name" \
+    --layout=reverse \
+    --info=hidden \
+    --border=rounded \
+    --border-label=' new session ' \
+    --prompt=' 󰆍  ' \
+    --pointer='❯' \
+    --color="$fzf_colors" \
+    --bind='esc:abort,ctrl-c:abort' \
+    --header=' Enter create   Esc cancel ' \
+    --preview-window=hidden | sed -n '1p')" || {
+    close_popup
+    exit 0
+  }
+
+  name="$(printf '%s' "$name" | tr ':' '-')"
+  [ -n "$name" ] || exit 0
+
+  if tmux has-session -t "=$name" 2>/dev/null; then
+    switch_target_to_session "$name"
+  fi
+
+  tmux new-session -d -s "$name" -c "$cwd" || {
+    tmux display-message "failed to create tmux session: $name"
+    exit 1
+  }
+  switch_target_to_session "$name"
+fi
+
+clean="$(clean_item "$selected")"
+session_name="$(printf '%s' "$clean" | tr ':' '-')"
+
+if tmux has-session -t "=$session_name" 2>/dev/null; then
+  switch_target_to_session "$session_name"
+fi
+
+session_json="$(cached_sesh json | jq -r --arg name "$clean" 'map(select(.Name == $name))[0] // empty')"
+path="$(printf '%s' "$session_json" | jq -r '.Path // empty' 2>/dev/null)"
+startup="$(printf '%s' "$session_json" | jq -r '.StartupCommand // empty' 2>/dev/null)"
+disable_startup="$(printf '%s' "$session_json" | jq -r '.DisableStartupCommand // false' 2>/dev/null)"
+
+if [ -z "$path" ]; then
+  path="$(pwd -P)"
+fi
+
+if [ "$disable_startup" != "true" ] && [ -n "$startup" ]; then
+  tmux new-session -d -s "$session_name" -c "$path" "$startup" || {
+    tmux display-message "failed to create tmux session: $session_name"
+    exit 1
+  }
+else
+  tmux new-session -d -s "$session_name" -c "$path" || {
+    tmux display-message "failed to create tmux session: $session_name"
+    exit 1
+  }
+fi
+
+switch_target_to_session "$session_name"

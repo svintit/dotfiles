@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+current_session=${TMUX_CONTEXT_SESSION:-$(tmux display-message -p '#{session_name}' 2>/dev/null || true)}
+client_name=${TMUX_CONTEXT_CLIENT:-$(tmux display-message -p '#{client_name}' 2>/dev/null || true)}
+client_tty=${TMUX_CONTEXT_TTY:-$(tmux display-message -p '#{client_tty}' 2>/dev/null || true)}
+
+outer_client=""
+outer_tty=""
+marker=""
+
+if [[ "$current_session" == _popup_window_* ]]; then
+  outer_client=$(tmux show-option -qv -t "$current_session" @popup_outer_client 2>/dev/null || true)
+  outer_tty=$(tmux show-option -qv -t "$current_session" @popup_outer_tty 2>/dev/null || true)
+  marker=$(tmux show-option -qv -t "$current_session" @popup_marker 2>/dev/null || true)
+else
+  outer_client="$client_name"
+  outer_tty="$client_tty"
+fi
+
+if [ -z "$marker" ] && [ -n "$outer_tty" ]; then
+  safe_client=$(printf '%s' "$outer_tty" | tr -c 'A-Za-z0-9._-' '_')
+  marker="/tmp/tmux-ghostty-popup-open-${safe_client}"
+fi
+
+[ -n "$marker" ] && rm -f "$marker"
+rm -f /tmp/tmux-ghostty-popup-open-* 2>/dev/null || true
+
+# Close popup on the target outer client first, then fall back to all clients.
+seen_targets=""
+close_target() {
+  local target=$1
+  [ -z "$target" ] && return 0
+  case " $seen_targets " in
+    *" $target "*) return 0 ;;
+  esac
+  seen_targets="$seen_targets $target"
+  tmux display-popup -C -c "$target" 2>/dev/null || true
+}
+
+close_target "$outer_client"
+close_target "$outer_tty"
+close_target "$client_name"
+close_target "$client_tty"
+while IFS= read -r target; do
+  close_target "$target"
+done < <(tmux list-clients -F '#{client_name}' 2>/dev/null || true)
+
+# If this command was handled by a nested popup tmux client, detach that client
+# so the popup shell exits and display-popup -E tears the popup down.
+if [[ "$current_session" == _popup_window_* ]] && [ -n "$client_name" ]; then
+  tmux detach-client -t "$client_name" 2>/dev/null || true
+fi

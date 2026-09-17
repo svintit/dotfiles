@@ -1,0 +1,408 @@
+after-startup-command = ['exec-and-forget sketchybar', 'exec-and-forget $HOME/.local/bin/aerospace-spotify-pin']
+
+# Update workspace integrations after each workspace change.
+exec-on-workspace-change = ['/bin/bash', '-c',
+  '/usr/bin/nohup /Applications/Hammerspoon.app/Contents/Frameworks/hs/hs -q -t 1 -c "if _G.refreshBorderForWorkspace then _G.refreshBorderForWorkspace() end; if _G.workspaceIndicator then _G.workspaceIndicator.refresh() end" </dev/null >/dev/null 2>&1 & /usr/bin/nohup $HOME/.local/bin/aerospace-spotify-pin </dev/null >/dev/null 2>&1 & sketchybar --trigger aerospace_workspace_change FOCUSED_WORKSPACE=$AEROSPACE_FOCUSED_WORKSPACE >/dev/null 2>&1 &',
+  'exec-and-forget borders active_color=0xffe1e3e4 inactive_color=0xff494d64 width=5.0'
+]
+
+# Start AeroSpace at login
+start-at-login = true
+
+# Normalizations. See: https://nikitabobko.github.io/AeroSpace/guide#normalization
+enable-normalization-flatten-containers = true
+enable-normalization-opposite-orientation-for-nested-containers = true
+
+# See: https://nikitabobko.github.io/AeroSpace/guide#layouts
+# The 'accordion-padding' specifies the size of accordion padding
+# You can set 0 to disable the padding feature
+accordion-padding = 300
+
+# Possible values: tiles|accordion
+default-root-container-layout = 'tiles'
+
+# Possible values: horizontal|vertical|auto
+# 'auto' means: wide monitor (anything wider than high) gets horizontal orientation,
+#               tall monitor (anything higher than wide) gets vertical orientation
+default-root-container-orientation = 'auto'
+
+# Mouse follows focus when focused monitor changes
+# Drop it from your config, if you don't like this behavior
+# See https://nikitabobko.github.io/AeroSpace/guide#on-focus-changed-callbacks
+# See https://nikitabobko.github.io/AeroSpace/commands#move-mouse
+# Fallback value (if you omit the key): on-focused-monitor-changed = []
+# on-focused-monitor-changed = ['move-mouse monitor-lazy-center']
+on-focused-monitor-changed = ['exec-and-forget /Applications/Hammerspoon.app/Contents/Frameworks/hs/hs -q -t 1 -c "if _G.workspaceIndicator then _G.workspaceIndicator.refresh() end" </dev/null >/dev/null 2>&1']
+
+# You can effectively turn off macOS "Hide application" (cmd-h) feature by toggling this flag
+# Useful if you don't use this macOS feature, but accidentally hit cmd-h or cmd-alt-h key
+# Also see: https://nikitabobko.github.io/AeroSpace/goodness#disable-hide-app
+automatically-unhide-macos-hidden-apps = false
+
+# Move Safari to workspace T on focus. on-window-detected does not fire for
+# Safari because AeroSpace's closed-window cache restores reopened windows
+# and skips on-window-detected; on-focus-changed catches it instead.
+on-focus-changed = ['exec-and-forget $HOME/.local/bin/aerospace-safari-pin', 'exec-and-forget /Applications/Hammerspoon.app/Contents/Frameworks/hs/hs -q -t 1 -c "if _G.workspaceIndicator then _G.workspaceIndicator.scheduleSelectionSync() end"']
+
+
+# Default all windows to floating. Specific apps below override to tiling.
+[[on-window-detected]]
+check-further-callbacks = true
+run = ['layout floating', 'exec-and-forget /Applications/Hammerspoon.app/Contents/Frameworks/hs/hs -q -t 1 -c "if _G.workspaceIndicator then _G.workspaceIndicator.refresh() end"']
+
+[[on-window-detected]]
+if.app-name-regex-substring = '^spotify$'
+if.window-title-regex-substring = '^Spotify - Web Player:| - Your Chromium$'
+run = 'exec-and-forget $HOME/.local/bin/aerospace-spotify-pin'
+
+[[on-window-detected]]
+if.app-name-regex-substring = 'iterm'
+run = 'move-node-to-workspace T'
+
+[[on-window-detected]]
+if.app-name-regex-substring = 'ghostty'
+run = ['layout tiling', 'move-node-to-workspace T']
+
+
+[[on-window-detected]]
+if.app-name-regex-substring = 'kitty'
+run = 'move-node-to-workspace T'
+
+[[on-window-detected]]
+if.app-name-regex-substring = 'obsidian'
+run = 'move-node-to-workspace O'
+
+[[on-window-detected]]
+if.app-name-regex-substring = 'spotify'
+run = ['layout tiling', 'move-node-to-workspace M']
+
+[[on-window-detected]]
+if.app-name-regex-substring = 'messages'
+run = ['layout tiling', 'move-node-to-workspace M']
+
+[[on-window-detected]]
+if.app-name-regex-substring = 'chrome'
+run = ['layout tiling', 'move-node-to-workspace W', 'layout tiles vertical --root']
+
+[[on-window-detected]]
+if.app-name-regex-substring = 'slack'
+run = ['layout tiling', 'move-node-to-workspace W', 'layout tiles vertical --root']
+
+[[on-window-detected]]
+if.app-name-regex-substring = 'cursor'
+run = ['layout tiling', 'move-node-to-workspace CODE']
+
+[[on-window-detected]]
+if.app-name-regex-substring = 'code'
+run = ['layout tiling', 'move-node-to-workspace CODE']
+
+[[on-window-detected]]
+if.app-name-regex-substring = 'zed'
+run = ['layout tiling', 'move-node-to-workspace CODE']
+
+
+# Possible values: (qwerty|dvorak)
+# See https://nikitabobko.github.io/AeroSpace/guide#key-mapping
+[key-mapping]
+preset = 'qwerty'
+
+# Gaps between windows (inner-*) and between monitor edges (outer-*).
+# Possible values:
+# - Constant:     gaps.outer.top = 8
+# - Per monitor:  gaps.outer.top = [{ monitor.main = 16 }, { monitor."some-pattern" = 32 }, 24]
+#                 In this example, 24 is a default value when there is no match.
+#                 Monitor pattern is the same as for 'workspace-to-monitor-force-assignment'.
+#                 See: https://nikitabobko.github.io/AeroSpace/guide#assign-workspaces-to-monitors
+[gaps]
+inner.horizontal = 20
+inner.vertical =   20
+outer.left =       40
+outer.bottom =     40
+# Per-monitor outer.top can be configured locally, e.g.:
+# outer.top = [{ monitor.<name> = 70 }, { monitor.built-in = 32 }, 40]
+outer.top =        40
+outer.right =      40
+
+# 'main' binding mode declaration
+# See: https://nikitabobko.github.io/AeroSpace/guide#binding-modes
+# 'main' binding mode must be always presented
+# Fallback value (if you omit the key): mode.main.binding = {}
+[mode.main.binding]
+
+# All possible keys:
+# - Letters.        a, b, c, ..., z
+# - Numbers.        0, 1, 2, ..., 9
+# - Keypad numbers. keypad0, keypad1, keypad2, ..., keypad9
+# - F-keys.         f1, f2, ..., f20
+# - Special keys.   minus, equal, period, comma, slash, backslash, quote, semicolon, backtick,
+#                   leftSquareBracket, rightSquareBracket, space, enter, esc, backspace, tab
+# - Keypad special. keypadClear, keypadDecimalMark, keypadDivide, keypadEnter, keypadEqual,
+#                   keypadMinus, keypadMultiply, keypadPlus
+# - Arrows.         left, down, up, right
+
+# All possible modifiers: cmd, alt, ctrl, shift
+
+# All possible commands: https://nikitabobko.github.io/AeroSpace/commands
+
+# See: https://nikitabobko.github.io/AeroSpace/commands#exec-and-forget
+# You can uncomment the following lines to open up terminal with alt + enter shortcut (like in i3)
+# alt-enter = '''exec-and-forget osascript -e '
+# tell application "Terminal"
+#     do script
+#     activate
+# end tell'
+# '''
+
+alt-shift-f = 'fullscreen'
+alt-ctrl-f = 'layout floating tiling'
+
+# See: https://nikitabobko.github.io/AeroSpace/commands#layout
+alt-slash = 'layout tiles horizontal vertical'
+alt-comma = 'layout accordion horizontal vertical'
+
+# See: https://nikitabobko.github.io/AeroSpace/commands#focus
+ctrl-h = 'focus left'
+ctrl-j = 'focus down'
+ctrl-k = 'focus up'
+ctrl-l = 'focus right'
+
+# See: https://nikitabobko.github.io/AeroSpace/commands#move
+ctrl-shift-h = 'move left'
+ctrl-shift-j = 'move down'
+ctrl-shift-k = 'move up'
+ctrl-shift-l = 'move right'
+
+alt-shift-s = 'swap --wrap-around dfs-next'
+
+
+# See: https://nikitabobko.github.io/AeroSpace/commands#resize
+alt-shift-minus = 'resize smart -50'
+alt-shift-equal = 'resize smart +50'
+
+# alt-1..9 intentionally unbound: reserved for tmux tab switching.
+# Use cmd-1..9 for per-monitor workspace slots.
+
+# Move the focused window to a slot on this monitor, then follow it.
+alt-shift-1 = 'exec-and-forget /usr/bin/open -g "hammerspoon://aerospace-workspace-slot?action=move-follow&slot=1"'
+alt-shift-2 = 'exec-and-forget /usr/bin/open -g "hammerspoon://aerospace-workspace-slot?action=move-follow&slot=2"'
+alt-shift-3 = 'exec-and-forget /usr/bin/open -g "hammerspoon://aerospace-workspace-slot?action=move-follow&slot=3"'
+alt-shift-4 = 'exec-and-forget /usr/bin/open -g "hammerspoon://aerospace-workspace-slot?action=move-follow&slot=4"'
+alt-shift-5 = 'exec-and-forget /usr/bin/open -g "hammerspoon://aerospace-workspace-slot?action=move-follow&slot=5"'
+alt-shift-6 = 'exec-and-forget /usr/bin/open -g "hammerspoon://aerospace-workspace-slot?action=move-follow&slot=6"'
+alt-shift-7 = 'exec-and-forget /usr/bin/open -g "hammerspoon://aerospace-workspace-slot?action=move-follow&slot=7"'
+alt-shift-8 = 'exec-and-forget /usr/bin/open -g "hammerspoon://aerospace-workspace-slot?action=move-follow&slot=8"'
+alt-shift-9 = 'exec-and-forget /usr/bin/open -g "hammerspoon://aerospace-workspace-slot?action=move-follow&slot=9"'
+
+alt-tab = 'workspace-back-and-forth'
+# cmd-tab = 'workspace-back-and-forth'
+# cmd-tab = 'workspace --wrap-around next'
+cmd-tab = 'exec-and-forget /usr/bin/open -g "hammerspoon://aerospace-workspace-slot?action=next"'
+alt-shift-tab = 'move-node-to-monitor --wrap-around next --focus-follows-window'
+# cmd-shift-tab = 'move-workspace-to-monitor --wrap-around next'
+# cmd-shift-tab = 'workspace --wrap-around prev'
+cmd-shift-tab = 'exec-and-forget /usr/bin/open -g "hammerspoon://aerospace-workspace-slot?action=prev"'
+
+ctrl-alt-tab = 'focus-monitor --wrap-around next'
+ctrl-alt-shift-tab = 'focus-monitor --wrap-around prev'
+
+# See: https://nikitabobko.github.io/AeroSpace/commands#mode
+alt-shift-semicolon = 'mode service'
+alt-shift-enter = 'mode apps'
+
+alt-t = 'exec-and-forget open -a /Applications/Ghostty.app'
+alt-g = 'exec-and-forget open -a /Applications/Google\ Chrome.app'
+alt-b = 'exec-and-forget open -a /Applications/Google\ Chrome.app'
+alt-s = 'exec-and-forget open -a /Applications/Slack.app'
+alt-f = 'exec-and-forget open -a Finder'
+alt-shift-m = 'exec-and-forget open -a /Applications/Messages.app'
+alt-m = 'workspace M'
+alt-w = 'workspace W'
+alt-c = 'workspace CODE'
+
+# Command is Omarchy Super; these bindings take precedence over app shortcuts.
+# Keep Cmd+W in applications so terminal tabs can close.
+cmd-q = 'close'
+# Keep Cmd+T in applications; Ctrl+Option+F toggles floating.
+cmd-j = 'focus down'
+cmd-alt-f = 'fullscreen'
+# Accordion approximates Hyprland grouping; it does not create Hyprland groups.
+cmd-g = 'layout accordion tiles'
+cmd-n = 'focus left'
+cmd-e = 'focus down'
+cmd-i = 'focus up'
+cmd-o = 'focus right'
+cmd-h = 'focus left'
+cmd-k = 'focus up'
+cmd-l = 'focus right'
+# cmd-1 = 'workspace 1'
+cmd-1 = 'exec-and-forget $HOME/.local/bin/aerospace-slot 1'
+# cmd-shift-1 = 'move-node-to-workspace 1 --focus-follows-window'
+cmd-shift-1 = 'exec-and-forget /usr/bin/open -g "hammerspoon://aerospace-workspace-slot?action=move-follow&slot=1"'
+# cmd-alt-shift-1 = 'move-node-to-workspace 1'
+cmd-alt-shift-1 = 'exec-and-forget /usr/bin/open -g "hammerspoon://aerospace-workspace-slot?action=move&slot=1"'
+# cmd-2 = 'workspace 2'
+cmd-2 = 'exec-and-forget $HOME/.local/bin/aerospace-slot 2'
+# cmd-shift-2 = 'move-node-to-workspace 2 --focus-follows-window'
+cmd-shift-2 = 'exec-and-forget /usr/bin/open -g "hammerspoon://aerospace-workspace-slot?action=move-follow&slot=2"'
+# cmd-alt-shift-2 = 'move-node-to-workspace 2'
+cmd-alt-shift-2 = 'exec-and-forget /usr/bin/open -g "hammerspoon://aerospace-workspace-slot?action=move&slot=2"'
+# cmd-3 = 'workspace 3'
+cmd-3 = 'exec-and-forget $HOME/.local/bin/aerospace-slot 3'
+# cmd-shift-3 = 'move-node-to-workspace 3 --focus-follows-window'
+cmd-shift-3 = 'exec-and-forget /usr/bin/open -g "hammerspoon://aerospace-workspace-slot?action=move-follow&slot=3"'
+# cmd-alt-shift-3 = 'move-node-to-workspace 3'
+cmd-alt-shift-3 = 'exec-and-forget /usr/bin/open -g "hammerspoon://aerospace-workspace-slot?action=move&slot=3"'
+# cmd-4 = 'workspace 4'
+cmd-4 = 'exec-and-forget $HOME/.local/bin/aerospace-slot 4'
+# cmd-shift-4 = 'move-node-to-workspace 4 --focus-follows-window'
+cmd-shift-4 = 'exec-and-forget /usr/bin/open -g "hammerspoon://aerospace-workspace-slot?action=move-follow&slot=4"'
+# cmd-alt-shift-4 = 'move-node-to-workspace 4'
+cmd-alt-shift-4 = 'exec-and-forget /usr/bin/open -g "hammerspoon://aerospace-workspace-slot?action=move&slot=4"'
+# cmd-5 = 'workspace 5'
+cmd-5 = 'exec-and-forget $HOME/.local/bin/aerospace-slot 5'
+# cmd-shift-5 = 'move-node-to-workspace 5 --focus-follows-window'
+cmd-shift-5 = 'exec-and-forget /usr/bin/open -g "hammerspoon://aerospace-workspace-slot?action=move-follow&slot=5"'
+# cmd-alt-shift-5 = 'move-node-to-workspace 5'
+cmd-alt-shift-5 = 'exec-and-forget /usr/bin/open -g "hammerspoon://aerospace-workspace-slot?action=move&slot=5"'
+# cmd-6 = 'workspace 6'
+cmd-6 = 'exec-and-forget $HOME/.local/bin/aerospace-slot 6'
+# cmd-shift-6 = 'move-node-to-workspace 6 --focus-follows-window'
+cmd-shift-6 = 'exec-and-forget /usr/bin/open -g "hammerspoon://aerospace-workspace-slot?action=move-follow&slot=6"'
+# cmd-alt-shift-6 = 'move-node-to-workspace 6'
+cmd-alt-shift-6 = 'exec-and-forget /usr/bin/open -g "hammerspoon://aerospace-workspace-slot?action=move&slot=6"'
+# cmd-7 = 'workspace 7'
+cmd-7 = 'exec-and-forget $HOME/.local/bin/aerospace-slot 7'
+# cmd-shift-7 = 'move-node-to-workspace 7 --focus-follows-window'
+cmd-shift-7 = 'exec-and-forget /usr/bin/open -g "hammerspoon://aerospace-workspace-slot?action=move-follow&slot=7"'
+# cmd-alt-shift-7 = 'move-node-to-workspace 7'
+cmd-alt-shift-7 = 'exec-and-forget /usr/bin/open -g "hammerspoon://aerospace-workspace-slot?action=move&slot=7"'
+# cmd-8 = 'workspace 8'
+cmd-8 = 'exec-and-forget $HOME/.local/bin/aerospace-slot 8'
+# cmd-shift-8 = 'move-node-to-workspace 8 --focus-follows-window'
+cmd-shift-8 = 'exec-and-forget /usr/bin/open -g "hammerspoon://aerospace-workspace-slot?action=move-follow&slot=8"'
+# cmd-alt-shift-8 = 'move-node-to-workspace 8'
+cmd-alt-shift-8 = 'exec-and-forget /usr/bin/open -g "hammerspoon://aerospace-workspace-slot?action=move&slot=8"'
+# cmd-9 = 'workspace 9'
+cmd-9 = 'exec-and-forget $HOME/.local/bin/aerospace-slot 9'
+# cmd-shift-9 = 'move-node-to-workspace 9 --focus-follows-window'
+cmd-shift-9 = 'exec-and-forget /usr/bin/open -g "hammerspoon://aerospace-workspace-slot?action=move-follow&slot=9"'
+# cmd-alt-shift-9 = 'move-node-to-workspace 9'
+cmd-alt-shift-9 = 'exec-and-forget /usr/bin/open -g "hammerspoon://aerospace-workspace-slot?action=move&slot=9"'
+# cmd-0 = 'workspace 10'
+cmd-0 = 'exec-and-forget /usr/bin/open -g "hammerspoon://aerospace-workspace-slot?action=focus&slot=10"'
+# cmd-shift-0 = 'move-node-to-workspace 10 --focus-follows-window'
+cmd-shift-0 = 'exec-and-forget /usr/bin/open -g "hammerspoon://aerospace-workspace-slot?action=move-follow&slot=10"'
+# cmd-alt-shift-0 = 'move-node-to-workspace 10'
+cmd-alt-shift-0 = 'exec-and-forget /usr/bin/open -g "hammerspoon://aerospace-workspace-slot?action=move&slot=10"'
+cmd-ctrl-tab = 'workspace-back-and-forth'
+cmd-minus = 'resize width -100'
+cmd-shift-minus = 'resize height -100'
+cmd-equal = 'resize width +100'
+cmd-shift-equal = 'resize height +100'
+cmd-alt-minus = 'resize width -25'
+cmd-alt-shift-minus = 'resize height -25'
+cmd-alt-equal = 'resize width +25'
+cmd-alt-shift-equal = 'resize height +25'
+cmd-ctrl-minus = 'resize width -300'
+cmd-ctrl-shift-minus = 'resize height -300'
+cmd-ctrl-equal = 'resize width +300'
+cmd-ctrl-shift-equal = 'resize height +300'
+# Keep Cmd+Enter in applications for actions such as sending Slack messages.
+cmd-alt-enter = 'exec-and-forget open -a /Applications/Ghostty.app'
+cmd-shift-enter = 'exec-and-forget open -a /Applications/Google\ Chrome.app'
+cmd-shift-f = 'exec-and-forget open -a Finder'
+cmd-shift-g = 'exec-and-forget open -a /Applications/Slack.app'
+cmd-shift-m = 'exec-and-forget open -a /Applications/Spotify.app'
+# cmd-shift-o = 'exec-and-forget open -a /Applications/Obsidian.app'
+cmd-shift-o = 'swap right'
+
+ctrl-alt-shift-m = 'move-workspace-to-monitor --wrap-around next'
+
+# Keep HJKL and NEIO paired for all directional controls.
+alt-shift-h = 'join-with left'
+alt-shift-n = 'join-with left'
+alt-shift-j = 'join-with down'
+alt-shift-e = 'join-with down'
+alt-shift-k = 'join-with up'
+alt-shift-i = 'join-with up'
+alt-shift-l = 'join-with right'
+alt-shift-o = 'join-with right'
+ctrl-n = 'focus left'
+ctrl-e = 'focus down'
+ctrl-i = 'focus up'
+ctrl-o = 'focus right'
+ctrl-alt-h = 'focus left'
+ctrl-alt-n = 'focus left'
+ctrl-alt-j = 'focus down'
+ctrl-alt-e = 'focus down'
+ctrl-alt-k = 'focus up'
+ctrl-alt-i = 'focus up'
+ctrl-alt-l = 'focus right'
+ctrl-alt-o = 'focus right'
+ctrl-shift-n = 'move left'
+ctrl-shift-e = 'move down'
+ctrl-shift-i = 'move up'
+ctrl-shift-o = 'move right'
+ctrl-alt-shift-h = 'swap left'
+ctrl-alt-shift-n = 'swap left'
+ctrl-alt-shift-j = 'swap down'
+ctrl-alt-shift-e = 'swap down'
+ctrl-alt-shift-k = 'swap up'
+ctrl-alt-shift-i = 'swap up'
+ctrl-alt-shift-l = 'swap right'
+ctrl-alt-shift-o = 'swap right'
+cmd-shift-h = 'swap left'
+cmd-shift-n = 'swap left'
+cmd-shift-j = 'swap down'
+cmd-shift-e = 'swap down'
+cmd-shift-k = 'swap up'
+cmd-shift-i = 'swap up'
+cmd-shift-l = 'swap right'
+cmd-alt-shift-h = 'move-workspace-to-monitor left'
+cmd-alt-shift-n = 'move-workspace-to-monitor left'
+cmd-alt-shift-j = 'move-workspace-to-monitor down'
+cmd-alt-shift-e = 'move-workspace-to-monitor down'
+cmd-alt-shift-k = 'move-workspace-to-monitor up'
+cmd-alt-shift-i = 'move-workspace-to-monitor up'
+cmd-alt-shift-l = 'move-workspace-to-monitor right'
+cmd-alt-shift-o = 'move-workspace-to-monitor right'
+cmd-alt-h = 'resize width -30'
+cmd-alt-n = 'resize width -30'
+cmd-alt-j = 'resize height +30'
+cmd-alt-e = 'resize height +30'
+cmd-alt-k = 'resize height -30'
+cmd-alt-i = 'resize height -30'
+cmd-alt-l = 'resize width +30'
+cmd-alt-o = 'resize width +30'
+cmd-ctrl-h = 'exec-and-forget $HOME/.local/bin/aerospace-monitor-select left'
+cmd-ctrl-n = 'exec-and-forget $HOME/.local/bin/aerospace-monitor-select left'
+cmd-ctrl-j = 'exec-and-forget $HOME/.local/bin/aerospace-monitor-select down'
+cmd-ctrl-e = 'exec-and-forget $HOME/.local/bin/aerospace-monitor-select down'
+cmd-ctrl-k = 'exec-and-forget $HOME/.local/bin/aerospace-monitor-select up'
+cmd-ctrl-i = 'exec-and-forget $HOME/.local/bin/aerospace-monitor-select up'
+cmd-ctrl-l = 'exec-and-forget $HOME/.local/bin/aerospace-monitor-select right'
+cmd-ctrl-o = 'exec-and-forget $HOME/.local/bin/aerospace-monitor-select right'
+cmd-ctrl-shift-h = 'move-node-to-monitor left --focus-follows-window'
+cmd-ctrl-shift-n = 'move-node-to-monitor left --focus-follows-window'
+cmd-ctrl-shift-j = 'move-node-to-monitor down --focus-follows-window'
+cmd-ctrl-shift-e = 'move-node-to-monitor down --focus-follows-window'
+cmd-ctrl-shift-k = 'move-node-to-monitor up --focus-follows-window'
+cmd-ctrl-shift-i = 'move-node-to-monitor up --focus-follows-window'
+cmd-ctrl-shift-l = 'move-node-to-monitor right --focus-follows-window'
+cmd-ctrl-shift-o = 'move-node-to-monitor right --focus-follows-window'
+alt-o = 'exec-and-forget open -a /Applications/Obsidian.app'
+
+# 'service' binding mode declaration.
+# See: https://nikitabobko.github.io/AeroSpace/guide#binding-modes
+[mode.service.binding]
+esc = ['reload-config', 'mode main']
+r = ['flatten-workspace-tree', 'mode main'] # reset layout
+f = ['layout floating tiling', 'mode main'] # Toggle between floating and tiling layout
+backspace = ['close-all-windows-but-current', 'mode main']
+
+[mode.apps.binding]
+alt-w = ['exec-and-forget open -a /Applications/WezTerm.app', 'mode main']
+
+# [workspace-to-monitor-force-assignment]
+# Removed from the public repo - this section contained machine-specific
+# monitor names and hardware UUIDs. Configure it locally in ~/.aerospace.toml.

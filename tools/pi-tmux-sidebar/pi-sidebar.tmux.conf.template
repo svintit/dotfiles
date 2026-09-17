@@ -1,0 +1,61 @@
+##### Pi sidebar
+##### Reversible include for a collapsible cross-session Pi status sidebar.
+##### Disable now:  __SIDEBAR_TOGGLE__ hide
+##### Remove later: delete the source-file line you added to your tmux config.
+
+set -g @pi_sidebar_width 53
+set -g @pi_sidebar_collapsed_width 10
+
+# prefix+B toggles the sidebar between expanded and collapsed handle modes.
+bind-key B run-shell -b '__SIDEBAR_TOGGLE__ toggle'
+
+# ctrl+<n> jumps to the session numbered <n> in the sidebar; ctrl+0 is 10.
+#
+# ctrl+digit has no usable native encoding: ctrl+1 emits nothing, ctrl+2 = NUL
+# = the C-Space prefix, ctrl+3 = ESC, etc. So a terminal that forwards a
+# private sequence per key (e.g. Ghostty: ctrl+digit -> \e[5;3004N~) is
+# required. `set -s user-keys[i]` is idempotent on re-source (unlike `set -as`),
+# so this block is safe to source repeatedly. Remove it if your terminal does
+# not forward these sequences.
+set -s user-keys[30] "\e[5;30040~"
+set -s user-keys[31] "\e[5;30041~"
+set -s user-keys[32] "\e[5;30042~"
+set -s user-keys[33] "\e[5;30043~"
+set -s user-keys[34] "\e[5;30044~"
+set -s user-keys[35] "\e[5;30045~"
+set -s user-keys[36] "\e[5;30046~"
+set -s user-keys[37] "\e[5;30047~"
+set -s user-keys[38] "\e[5;30048~"
+set -s user-keys[39] "\e[5;30049~"
+bind-key -n User30 run-shell -b 'PI_SIDEBAR_CLIENT="#{client_name}" __SIDEBAR_CMD__ --jump 1'
+bind-key -n User31 run-shell -b 'PI_SIDEBAR_CLIENT="#{client_name}" __SIDEBAR_CMD__ --jump 2'
+bind-key -n User32 run-shell -b 'PI_SIDEBAR_CLIENT="#{client_name}" __SIDEBAR_CMD__ --jump 3'
+bind-key -n User33 run-shell -b 'PI_SIDEBAR_CLIENT="#{client_name}" __SIDEBAR_CMD__ --jump 4'
+bind-key -n User34 run-shell -b 'PI_SIDEBAR_CLIENT="#{client_name}" __SIDEBAR_CMD__ --jump 5'
+bind-key -n User35 run-shell -b 'PI_SIDEBAR_CLIENT="#{client_name}" __SIDEBAR_CMD__ --jump 6'
+bind-key -n User36 run-shell -b 'PI_SIDEBAR_CLIENT="#{client_name}" __SIDEBAR_CMD__ --jump 7'
+bind-key -n User37 run-shell -b 'PI_SIDEBAR_CLIENT="#{client_name}" __SIDEBAR_CMD__ --jump 8'
+bind-key -n User38 run-shell -b 'PI_SIDEBAR_CLIENT="#{client_name}" __SIDEBAR_CMD__ --jump 9'
+bind-key -n User39 run-shell -b 'PI_SIDEBAR_CLIENT="#{client_name}" __SIDEBAR_CMD__ --jump 10'
+
+# Keep the sidebar present when switching sessions or tmux windows.
+# Use numbered hook slots so existing hooks stay intact.
+set-hook -g client-session-changed[78] 'run-shell -b "TMUX_TARGET_PANE=\"#{pane_id}\" TMUX_SIDEBAR_PID=\"#{@pi_sidebar_external_pid}\" __SIDEBAR_TOGGLE__ selection-changed"'
+set-hook -g after-select-window[78] 'run-shell -b "TMUX_TARGET_PANE=\"#{pane_id}\" TMUX_SIDEBAR_PID=\"#{@pi_sidebar_external_pid}\" __SIDEBAR_TOGGLE__ selection-changed"'
+set-hook -g after-new-window[78] 'run-shell -b "TMUX_TARGET_PANE=\"#{pane_id}\" TMUX_SIDEBAR_PID=\"#{@pi_sidebar_external_pid}\" __SIDEBAR_TOGGLE__ selection-changed"'
+set-hook -g after-select-pane[78] 'run-shell -b "TMUX_TARGET_PANE=\"#{pane_id}\" TMUX_SIDEBAR_PID=\"#{@pi_sidebar_external_pid}\" __SIDEBAR_TOGGLE__ selection-changed"'
+set-hook -gu client-session-changed[79]
+set-hook -gu after-select-window[79]
+set-hook -gu after-new-window[79]
+set-hook -g client-session-changed[80] 'run-shell -b "TMUX_TARGET_SESSION=\"#{session_name}\" TMUX_TARGET_WINDOW=\"#{window_id}\" TMUX_TARGET_PANE=\"#{pane_id}\" TMUX_TARGET_CLIENT=\"#{client_name}\" __SIDEBAR_TOGGLE__ ensure"'
+set-hook -g after-select-window[80] 'run-shell -b "TMUX_TARGET_SESSION=\"#{session_name}\" TMUX_TARGET_WINDOW=\"#{window_id}\" TMUX_TARGET_PANE=\"#{pane_id}\" TMUX_TARGET_CLIENT=\"#{client_name}\" __SIDEBAR_TOGGLE__ ensure"'
+set-hook -g after-new-window[80] 'run-shell -b "TMUX_TARGET_SESSION=\"#{session_name}\" TMUX_TARGET_WINDOW=\"#{window_id}\" TMUX_TARGET_PANE=\"#{pane_id}\" TMUX_TARGET_CLIENT=\"#{client_name}\" __SIDEBAR_TOGGLE__ ensure"'
+
+# Re-assert fixed sidebar width when the window is resized (tmux redistributes
+# pane space proportionally on resize, which drifts the sidebar width).
+set-hook -g window-resized[80] 'run-shell -b "TMUX_TARGET_WINDOW=\"#{window_id}\" __SIDEBAR_TOGGLE__ resize"'
+
+# Clicking the sidebar always hands focus back to the real pane. The
+# sidebar's own click handling (session jump, collapse button) still
+# receives the event via the forwarded mouse sequence.
+bind -n MouseDown1Pane if -F '#{==:#{mouse_pane},#{@pi_sidebar_pane}}' 'send-keys -M ; run-shell "__SIDEBAR_TOGGLE__ focus-real #{window_id}"' 'select-pane -t = ; send-keys -M'

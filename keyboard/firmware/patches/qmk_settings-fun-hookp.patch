@@ -1,0 +1,18 @@
+diff --git a/quantum/qmk_settings.c b/quantum/qmk_settings.c
+index e5312d0f..df0d5f12 100644
+--- a/quantum/qmk_settings.c
++++ b/quantum/qmk_settings.c
+@@ -293,7 +293,13 @@ bool get_permissive_hold(uint16_t keycode, keyrecord_t *record) {
+     return QS_tapping_permissive_hold;
+ }
+ 
++// Fun layer key (LT6, right thumb) always resolves to hold on the next
++// keypress, so Fun + <key> chords fire immediately regardless of release
++// order. Every other hold-tap key keeps the Vial-configured global setting.
+ bool get_hold_on_other_key_press(uint16_t keycode, keyrecord_t *record) {
++    if (keycode == LT(6, KC_DELETE)) {
++        return true;
++    }
+     return QS_tapping_hold_on_other_key_press;
+ }
+ 

@@ -1,0 +1,171 @@
+#!/usr/bin/env python3
+import fcntl
+import os
+import pty
+import select
+import signal
+import struct
+import subprocess
+import sys
+import termios
+import time
+import tty
+
+CLOSE_SEQS = [
+    # Standard mode: user-key sequences sent as-is by tmux.
+    b"\x1b[5;30013~",  # cmd+w -> User12
+    b"\x1b[5;30026~",  # section key -> User25
+    b"\x1b[5;30022~",  # cmd+shift+t -> User21, legacy popup toggle key
+    b"\x1bF",          # old cmd+w mapping: esc:F -> M-F
+    "§".encode(),       # literal section key, if Ghostty passes it through
+    # Extended mode (MODE_KEYS_EXTENDED_2): when user-keys are suspended,
+    # tmux can't match the full user-key sequence and splits it into
+    # M-[ + remaining chars. M-[ is re-encoded by tmux:
+    #   csi-u format:  \x1b[91;3u    (extended-keys-format=csi-u)
+    #   xterm format:  \x1b[27;3;91~ (extended-keys-format=xterm)
+    # The remaining chars (e.g. "5;30026~") are plain ASCII, sent as-is.
+    # csi-u variants (current format):
+    b"\x1b[91;3u5;30013~",  # cmd+w
+    b"\x1b[91;3u5;30026~",  # section key
+    b"\x1b[91;3u5;30022~",  # cmd+shift+t
+    b"\x1b[70;3u",          # M-F in csi-u
+    # xterm format variants (for robustness if format changes):
+    b"\x1b[27;3;91~5;30013~",  # cmd+w
+    b"\x1b[27;3;91~5;30026~",  # section key
+    b"\x1b[27;3;91~5;30022~",  # cmd+shift+t
+    b"\x1b[27;3;70~",          # M-F in xterm
+]
+ESCAPE_KEY = b"\x1b"
+ESCAPE_CLOSE_DELAY = 0.05
+MAX_CLOSE_LEN = max(len(seq) for seq in CLOSE_SEQS)
+
+popup_session = os.environ.get("POPUP_SESSION")
+popup_marker = os.environ.get("POPUP_MARKER")
+if not popup_session:
+    print("POPUP_SESSION unset", file=sys.stderr)
+    sys.exit(2)
+
+child = None
+master_fd = None
+old_attrs = None
+input_buffer = b""
+escape_started_at = None
+closing = False
+DEBUG_LOG = "/tmp/tmux-popup-proxy-keys.log"
+
+def debug_log(data):
+    try:
+        with open(DEBUG_LOG, "ab") as log:
+            log.write(data.hex().encode() + b"\n")
+    except Exception:
+        pass
+
+def cleanup(*_args):
+    global closing
+    if closing:
+        return
+    closing = True
+    if popup_marker:
+        try:
+            os.unlink(popup_marker)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+    if old_attrs is not None:
+        try:
+            termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old_attrs)
+        except Exception:
+            pass
+    if child is not None and child.poll() is None:
+        try:
+            child.terminate()
+        except Exception:
+            pass
+    raise SystemExit(0)
+
+def resize_child_pty(*_args):
+    if master_fd is None:
+        return
+    try:
+        winsz = fcntl.ioctl(sys.stdin.fileno(), termios.TIOCGWINSZ, b"\0" * 8)
+        fcntl.ioctl(master_fd, termios.TIOCSWINSZ, winsz)
+    except Exception:
+        pass
+
+def flush_input(force=False):
+    global input_buffer, escape_started_at
+    while input_buffer:
+        if not force and input_buffer == ESCAPE_KEY:
+            if escape_started_at is None:
+                escape_started_at = time.monotonic()
+            return
+
+        escape_started_at = None
+        for seq in CLOSE_SEQS:
+            if input_buffer.startswith(seq):
+                cleanup()
+        if not force and any(seq.startswith(input_buffer) for seq in CLOSE_SEQS):
+            return
+        if len(input_buffer) > MAX_CLOSE_LEN or force:
+            os.write(master_fd, input_buffer[:1])
+            input_buffer = input_buffer[1:]
+        else:
+            # Buffer is not a close prefix, so forward one byte and continue.
+            os.write(master_fd, input_buffer[:1])
+            input_buffer = input_buffer[1:]
+
+for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+    signal.signal(sig, cleanup)
+signal.signal(signal.SIGWINCH, resize_child_pty)
+
+try:
+    if os.isatty(sys.stdin.fileno()):
+        old_attrs = termios.tcgetattr(sys.stdin.fileno())
+        tty.setraw(sys.stdin.fileno())
+
+    master_fd, slave_fd = pty.openpty()
+    resize_child_pty()
+    child = subprocess.Popen(
+        ["tmux", "attach-session", "-t", popup_session],
+        stdin=slave_fd,
+        stdout=slave_fd,
+        stderr=slave_fd,
+        close_fds=True,
+        env=os.environ.copy(),
+    )
+    os.close(slave_fd)
+
+    while True:
+        if child.poll() is not None:
+            cleanup()
+        readable, _, _ = select.select([sys.stdin.fileno(), master_fd], [], [], 0.02)
+        if not readable and input_buffer == ESCAPE_KEY and escape_started_at is not None:
+            if time.monotonic() - escape_started_at >= ESCAPE_CLOSE_DELAY:
+                cleanup()
+        for fd in readable:
+            if fd == sys.stdin.fileno():
+                data = os.read(fd, 4096)
+                if not data:
+                    cleanup()
+                debug_log(data)
+                input_buffer += data
+                flush_input()
+            elif fd == master_fd:
+                data = os.read(fd, 4096)
+                if not data:
+                    cleanup()
+                os.write(sys.stdout.fileno(), data)
+except (OSError, EOFError):
+    cleanup()
+finally:
+    if old_attrs is not None:
+        try:
+            termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old_attrs)
+        except Exception:
+            pass
+    if popup_marker:
+        try:
+            os.unlink(popup_marker)
+        except Exception:
+            pass

@@ -1,0 +1,663 @@
+diff --git a/cmd-resize-pane.c b/cmd-resize-pane.c
+index 8ad2655d..aeb1069b 100644
+--- a/cmd-resize-pane.c
++++ b/cmd-resize-pane.c
+@@ -193,8 +193,8 @@ cmd_resize_pane_mouse_update_floating(struct client *c, struct mouse_event *m)
+ 	lc = wp->layout_cell;
+ 	sx = wp->sx;
+ 	sy = wp->sy;
+-	left = wp->xoff - 1;
+-	right = wp->xoff + sx;
++	left = wp->xoff - wp->padding - 1;
++	right = wp->xoff + sx + wp->padding;
+ 	if (window_pane_show_scrollbar(wp) &&
+ 	    w->sb_pos == PANE_SCROLLBARS_LEFT) {
+ 		left -= wp->scrollbar_style.width + wp->scrollbar_style.pad;
+diff --git a/layout.c b/layout.c
+index 70226d6a..a6de3c1e 100644
+--- a/layout.c
++++ b/layout.c
+@@ -359,7 +359,7 @@ layout_fix_panes(struct window *w, struct window_pane *skip)
+ {
+ 	struct window_pane	*wp;
+ 	struct layout_cell	*lc;
+-	int			 status, sb_w, sb_pad;
++	int			 status, sb_w, sb_pad, pad;
+ 	u_int			 sx, sy;
+ 
+ 	status = options_get_number(w->options, "pane-border-status");
+@@ -404,6 +404,21 @@ layout_fix_panes(struct window *w, struct window_pane *skip)
+ 			wp->flags |= PANE_REDRAWSCROLLBAR;
+ 		}
+ 
++		/* Apply symmetric horizontal content padding. */
++		if (window_pane_is_floating(wp))
++			wp->padding = 0;
++		else {
++			pad = window_pane_padding(wp);
++			if (pad > 0 && (int)sx - 2 * pad < PANE_MINIMUM)
++				pad = ((int)sx - PANE_MINIMUM) / 2;
++			if (pad < 0)
++				pad = 0;
++			wp->padding = pad;
++			if (pad > 0) {
++				wp->xoff += pad;
++				sx -= 2 * pad;
++			}
++		}
+ 		window_pane_resize(wp, sx, sy);
+ 	}
+ }
+diff --git a/options-table.c b/options-table.c
+index d743cdf1..a0fef866 100644
+--- a/options-table.c
++++ b/options-table.c
+@@ -1405,6 +1405,15 @@ const struct options_table_entry options_table[] = {
+ 	  .text = "Style of the pane scrollbar."
+ 	},
+ 
++	{ .name = "pane-padding",
++	  .type = OPTIONS_TABLE_NUMBER,
++	  .scope = OPTIONS_TABLE_WINDOW|OPTIONS_TABLE_PANE,
++	  .minimum = 0,
++	  .maximum = 20,
++	  .default_num = 0,
++	  .text = "Padding on each side of pane content, in columns."
++	},
++
+ 	{ .name = "pane-scrollbars-position",
+ 	  .type = OPTIONS_TABLE_CHOICE,
+ 	  .scope = OPTIONS_TABLE_WINDOW,
+diff --git a/options.c b/options.c
+index e38056c3..8f35ebb0 100644
+--- a/options.c
++++ b/options.c
+@@ -1253,6 +1253,12 @@ options_push_changes(const char *name)
+ 		RB_FOREACH(w, windows, &windows)
+ 			layout_fix_panes(w, NULL);
+ 	}
++	if (strcmp(name, "pane-padding") == 0) {
++		RB_FOREACH(w, windows, &windows) {
++			layout_fix_panes(w, NULL);
++			server_redraw_window(w);
++		}
++	}
+ 	if (strcmp(name, "codepoint-widths") == 0)
+ 		utf8_update_width_cache();
+ 	if (strcmp(name, "input-buffer-size") == 0)
+diff --git a/regress/pane-padding.sh b/regress/pane-padding.sh
+new file mode 100755
+index 00000000..2b45a4ac
+--- /dev/null
++++ b/regress/pane-padding.sh
+@@ -0,0 +1,92 @@
++#!/bin/sh
++
++# pane-padding: verify symmetric content padding geometry.
++# Covers: zero padding, padding 2, narrow panes, horizontal split,
++# vertical split, and scrollbar coexistence.
++
++PATH=/bin:/usr/bin
++TERM=screen
++
++[ -z "$TEST_TMUX" ] && TEST_TMUX="$PWD/../tmux"
++TMUX="$TEST_TMUX -Lpadtest -f/dev/null"
++$TMUX kill-server 2>/dev/null
++
++fail=0
++check() {
++	# $1 = expected, $2 = actual, $3 = label
++	if [ "$1" != "$2" ]; then
++		echo "FAIL: $3: expected $1 got $2"
++		fail=1
++	fi
++}
++
++# Single 80x24 pane, no padding (stock geometry).
++$TMUX new-session -d -x80 -y24 -s t
++w=$($TMUX display-message -p -t t '#{pane_width}')
++l=$($TMUX display-message -p -t t '#{pane_left}')
++check 80 "$w" "stock width"
++check 0 "$l" "stock left"
++
++# padding 2: content shrinks by 4, offset shifts by 2.
++$TMUX set -g pane-padding 2
++w=$($TMUX display-message -p -t t '#{pane_width}')
++l=$($TMUX display-message -p -t t '#{pane_left}')
++check 76 "$w" "pad2 width"
++check 2 "$l" "pad2 left"
++
++# Out of range is rejected by the option table (max 20).
++$TMUX set -g pane-padding 99 2>/dev/null && fail=1
++v=$($TMUX show-options -g pane-padding)
++check "pane-padding 2" "$v" "range clamp keeps prior"
++
++# Horizontal split: both panes keep content >= PANE_MINIMUM and offsets shift.
++$TMUX set -g pane-padding 3
++$TMUX split-window -h -t t
++$TMUX list-panes -t t -F '#{pane_index}:#{pane_width}:#{pane_left}' > /tmp/.pp_h
++n=$(wc -l < /tmp/.pp_h | tr -d ' ')
++check 2 "$n" "hsplit count"
++# Every content width is at least PANE_MINIMUM (1) and offset >= padding.
++awk -F: '{ if ($2 < 1) exit 1; if ($3 < 3) exit 2 }' /tmp/.pp_h || fail=1
++
++# Vertical split: heights split, widths unaffected by vertical split.
++$TMUX split-window -v -t t:0.0
++$TMUX list-panes -t t -F '#{pane_index}:#{pane_width}:#{pane_height}' > /tmp/.pp_v
++n=$(wc -l < /tmp/.pp_v | tr -d ' ')
++check 3 "$n" "vsplit count"
++awk -F: '{ if ($2 < 1 || $3 < 1) exit 1 }' /tmp/.pp_v || fail=1
++
++# Scrollbar coexistence with padding: no crash, content still >= PANE_MINIMUM.
++$TMUX set -g pane-scrollbars on
++$TMUX set -g pane-scrollbars-position right
++$TMUX list-panes -t t -F '#{pane_width}:#{pane_left}' > /tmp/.pp_sb
++awk -F: '{ if ($1 < 1) exit 1 }' /tmp/.pp_sb || fail=1
++$TMUX set -g pane-scrollbars-position left
++$TMUX list-panes -t t -F '#{pane_width}:#{pane_left}' >/dev/null || fail=1
++
++# Narrow panes: large padding clamps so content stays >= PANE_MINIMUM.
++$TMUX set -g pane-padding 10
++$TMUX resize-window -t t -x12 -y10
++$TMUX list-panes -t t -F '#{pane_width}' > /tmp/.pp_narrow
++awk '{ if ($1 < 1) exit 1 }' /tmp/.pp_narrow || fail=1
++
++# Resize a pane: no crash, content still valid.
++$TMUX resize-window -t t -x40 -y10
++$TMUX resize-pane -t t:0.0 -R 4
++$TMUX list-panes -t t -F '#{pane_width}' >/dev/null || fail=1
++
++# padding 0 restores stock geometry (single pane).
++$TMUX kill-pane -t t:0.1 2>/dev/null
++$TMUX kill-pane -t t:0.1 2>/dev/null
++$TMUX set -g pane-padding 0
++$TMUX set -g pane-scrollbars off
++$TMUX resize-window -t t -x80 -y24
++w=$($TMUX display-message -p -t t '#{pane_width}')
++l=$($TMUX display-message -p -t t '#{pane_left}')
++check 80 "$w" "restore width"
++check 0 "$l" "restore left"
++
++$TMUX kill-server 2>/dev/null
++rm -f /tmp/.pp_h /tmp/.pp_v /tmp/.pp_sb /tmp/.pp_narrow
++[ "$fail" = 0 ] && echo "pane-padding: all checks passed" && exit 0
++echo "pane-padding: FAILED"
++exit 1
+diff --git a/screen-redraw.c b/screen-redraw.c
+index e1d8c628..1e761344 100644
+--- a/screen-redraw.c
++++ b/screen-redraw.c
+@@ -128,11 +128,12 @@ screen_redraw_pane_border(struct screen_redraw_ctx *ctx, struct window_pane *wp,
+ 	int		 ex = wp->xoff + wp->sx, ey = wp->yoff + wp->sy;
+ 	int		 hsplit = 0, vsplit = 0, pane_status = ctx->pane_status;
+ 	int		 sb_w = 0;
++	int		 pad = wp->padding;
+ 	int		 sx = wp->sx, sy = wp->sy, left, right;
+ 	enum layout_type split_type;
+ 
+ 	/* Inside pane. */
+-	if (px >= wp->xoff && px < ex && py >= wp->yoff && py < ey)
++	if (px >= wp->xoff - pad && px < ex + pad && py >= wp->yoff && py < ey)
+ 		return (SCREEN_REDRAW_INSIDE);
+ 
+ 	/* Are scrollbars enabled? */
+@@ -181,27 +182,27 @@ screen_redraw_pane_border(struct screen_redraw_ctx *ctx, struct window_pane *wp,
+ 	if ((wp->yoff == 0 || py >= wp->yoff - 1) && py <= ey) {
+ 		if (w->sb != PANE_SCROLLBARS_OFF &&
+ 		    w->sb_pos == PANE_SCROLLBARS_LEFT) {
+-			if (wp->xoff - sb_w == 0 && px == sx + sb_w) {
++			if (wp->xoff - sb_w - pad == 0 && px == sx + sb_w + 2 * pad) {
+ 				if (!hsplit || (hsplit && py <= sy / 2))
+ 					return (SCREEN_REDRAW_BORDER_RIGHT);
+ 			}
+-			if (wp->xoff - sb_w != 0) {
+-				if (px == wp->xoff - sb_w - 1 &&
++			if (wp->xoff - sb_w - pad != 0) {
++				if (px == wp->xoff - sb_w - pad - 1 &&
+ 				    (!hsplit || (hsplit && py > sy / 2)))
+ 					return (SCREEN_REDRAW_BORDER_LEFT);
+-				if (px == wp->xoff + sx + sb_w - 1)
++				if (px == wp->xoff + sx + sb_w - 1 + pad)
+ 					return (SCREEN_REDRAW_BORDER_RIGHT);
+ 			}
+ 		} else { /* w->sb_pos == PANE_SCROLLBARS_RIGHT or disabled */
+-			if (wp->xoff == 0 && px == sx + sb_w) {
++			if (wp->xoff - pad == 0 && px == sx + sb_w + 2 * pad) {
+ 				if (!hsplit || (hsplit && py <= sy / 2))
+ 					return (SCREEN_REDRAW_BORDER_RIGHT);
+ 			}
+-			if (wp->xoff != 0) {
+-				if (px == wp->xoff - 1 &&
++			if (wp->xoff - pad != 0) {
++				if (px == wp->xoff - pad - 1 &&
+ 				    (!hsplit || (hsplit && py > sy / 2)))
+ 					return (SCREEN_REDRAW_BORDER_LEFT);
+-				if (px == wp->xoff + sx + sb_w)
++				if (px == wp->xoff + sx + sb_w + pad)
+ 					return (SCREEN_REDRAW_BORDER_RIGHT);
+ 			}
+ 		}
+@@ -216,8 +217,8 @@ screen_redraw_pane_border(struct screen_redraw_ctx *ctx, struct window_pane *wp,
+ 	} else {
+ 		if (w->sb != PANE_SCROLLBARS_OFF &&
+ 		    w->sb_pos == PANE_SCROLLBARS_LEFT) {
+-			if ((wp->xoff - sb_w == 0 || px >= wp->xoff - sb_w) &&
+-			    (px <= ex || (sb_w != 0 && px < ex + sb_w))) {
++			if ((wp->xoff - sb_w - pad == 0 || px >= wp->xoff - sb_w - pad) &&
++			    (px <= ex + pad || (sb_w != 0 && px < ex + pad + sb_w))) {
+ 				if (pane_status != PANE_STATUS_BOTTOM &&
+ 				    wp->yoff != 0 && py == wp->yoff - 1)
+ 					return (SCREEN_REDRAW_BORDER_TOP);
+@@ -225,8 +226,8 @@ screen_redraw_pane_border(struct screen_redraw_ctx *ctx, struct window_pane *wp,
+ 					return (SCREEN_REDRAW_BORDER_BOTTOM);
+ 			}
+ 		} else { /* w->sb_pos == PANE_SCROLLBARS_RIGHT */
+-			if ((wp->xoff == 0 || px >= wp->xoff) &&
+-			    (px <= ex || (sb_w != 0 && px < ex + sb_w))) {
++			if ((wp->xoff - pad == 0 || px >= wp->xoff - pad) &&
++			    (px <= ex + pad || (sb_w != 0 && px < ex + pad + sb_w))) {
+ 				if (pane_status != PANE_STATUS_BOTTOM &&
+ 				    wp->yoff != 0 &&
+ 				    py == wp->yoff - 1)
+@@ -246,15 +247,17 @@ static int
+ screen_redraw_cell_border1(struct screen_redraw_ctx *ctx, int sb_pos, int sb_w,
+     struct window_pane *wp, int px, int py)
+ {
++	int	pad = wp->padding;
++
+ 	if (sb_pos == PANE_SCROLLBARS_LEFT) {
+-		if ((px < wp->xoff - 1 - sb_w ||
+-		    px > wp->xoff + (int)wp->sx) &&
++		if ((px < wp->xoff - pad - 1 - sb_w ||
++		    px > wp->xoff + (int)wp->sx + pad) &&
+ 		    (py < wp->yoff - 1 ||
+ 		    py > wp->yoff + (int)wp->sy))
+ 			return (-1);
+ 	} else { /* PANE_SCROLLBARS_RIGHT or off. */
+-		if ((px < wp->xoff - 1 ||
+-		    px > wp->xoff + (int)wp->sx + sb_w) &&
++		if ((px < wp->xoff - pad - 1 ||
++		    px > wp->xoff + (int)wp->sx + pad + sb_w) &&
+ 		    (py < wp->yoff - 1 ||
+ 		    py > wp->yoff + (int)wp->sy))
+ 			return (-1);
+@@ -453,14 +456,14 @@ screen_redraw_check_cell(struct screen_redraw_ctx *ctx, int px, int py,
+ 		sb_w = wp->scrollbar_style.width + wp->scrollbar_style.pad;
+ 		if (w->sb != PANE_SCROLLBARS_OFF &&
+ 		    w->sb_pos == PANE_SCROLLBARS_LEFT) {
+-			if ((px >= wp->xoff - 1 - sb_w &&
+-			    px <= wp->xoff + (int)wp->sx) &&
++		if ((px >= wp->xoff - wp->padding - 1 - sb_w &&
++		    px <= wp->xoff + (int)wp->sx + wp->padding) &&
+ 			    (py >= wp->yoff - 1 &&
+ 			    py <= wp->yoff + (int)wp->sy))
+ 				break;
+ 		} else { /* PANE_SCROLLBARS_RIGHT or none. */
+-			if ((px >= wp->xoff - 1 &&
+-			    px <= wp->xoff + (int)wp->sx + sb_w) &&
++		if ((px >= wp->xoff - wp->padding - 1 &&
++		    px <= wp->xoff + (int)wp->sx + wp->padding + sb_w) &&
+ 			    (py >= wp->yoff - 1 &&
+ 			    py <= wp->yoff + (int)wp->sy))
+ 				break;
+@@ -494,14 +497,14 @@ screen_redraw_check_cell(struct screen_redraw_ctx *ctx, int px, int py,
+ 		sb_w = wp->scrollbar_style.width + wp->scrollbar_style.pad;
+ 		if (w->sb != PANE_SCROLLBARS_OFF &&
+ 		    w->sb_pos == PANE_SCROLLBARS_LEFT) {
+-			if ((px < wp->xoff - 1 - sb_w ||
+-			     px > wp->xoff + (int)wp->sx) &&
++		if ((px < wp->xoff - wp->padding - 1 - sb_w ||
++		     px > wp->xoff + (int)wp->sx + wp->padding) &&
+ 			    (py < wp->yoff - 1 ||
+ 			    py > wp->yoff + (int)wp->sy))
+ 				goto next;
+ 		} else { /* PANE_SCROLLBARS_RIGHT or none */
+-			if ((px < wp->xoff - 1 ||
+-			     px > wp->xoff + (int)wp->sx + sb_w) &&
++		if ((px < wp->xoff - wp->padding - 1 ||
++		     px > wp->xoff + (int)wp->sx + wp->padding + sb_w) &&
+ 			    (py < wp->yoff - 1 ||
+ 			     py > wp->yoff + (int)wp->sy))
+ 				goto next;
+@@ -516,8 +519,8 @@ screen_redraw_check_cell(struct screen_redraw_ctx *ctx, int px, int py,
+ 				pane_status_line = wp->yoff - 1;
+ 			else
+ 				pane_status_line = wp->yoff + (int)wp->sy;
+-			left = wp->xoff + 2;
+-			right = wp->xoff + 2 + (int)wp->status_size - 1;
++			left = wp->xoff - wp->padding + 2;
++			right = wp->xoff - wp->padding + 2 + (int)wp->status_size - 1;
+ 			if (py == pane_status_line + (int)ctx->oy &&
+ 			    px >= left &&
+ 			    px <= right)
+@@ -538,11 +541,11 @@ screen_redraw_check_cell(struct screen_redraw_ctx *ctx, int px, int py,
+ 			     py < wp->yoff + (int)wp->sy)) {
+ 				/* Check if px lies within a scrollbar. */
+ 				if ((w->sb_pos == PANE_SCROLLBARS_RIGHT &&
+-				    (px >= wp->xoff + (int)wp->sx &&
+-				    px < wp->xoff + (int)wp->sx + sb_w)) ||
+-				    (w->sb_pos == PANE_SCROLLBARS_LEFT &&
+-				    (px >= wp->xoff - sb_w &&
+-				    px < wp->xoff)))
++			    (px >= wp->xoff + (int)wp->sx + wp->padding &&
++			    px < wp->xoff + (int)wp->sx + wp->padding + sb_w)) ||
++			    (w->sb_pos == PANE_SCROLLBARS_LEFT &&
++			    (px >= wp->xoff - sb_w - wp->padding &&
++			    px < wp->xoff - wp->padding)))
+ 					return (CELL_SCROLLBAR);
+ 			}
+ 		}
+@@ -616,8 +619,8 @@ screen_redraw_make_pane_status(struct client *c, struct window_pane *wp,
+ 	if (wp->sx < 4)
+ 		width = 0;
+ 	else
+-		width = wp->sx + sb_w - 2;
+-	max_width = (int)w->sx - (wp->xoff + 2);
++		width = wp->sx + 2 * wp->padding + sb_w - 2;
++	max_width = (int)w->sx - (wp->xoff - wp->padding + 2);
+ 	if (max_width < 0)
+ 		max_width = 0;
+ 	if (width > (u_int)max_width)
+@@ -631,7 +634,7 @@ screen_redraw_make_pane_status(struct client *c, struct window_pane *wp,
+ 	screen_write_start(&ctx, &wp->status_screen);
+ 
+ 	for (i = 0; i < width; i++) {
+-		px = wp->xoff + 2 + i;
++		px = wp->xoff - wp->padding + 2 + i;
+ 		if (pane_status == PANE_STATUS_TOP)
+ 			py = wp->yoff - 1;
+ 		else
+@@ -686,7 +689,7 @@ screen_redraw_draw_pane_status(struct screen_redraw_ctx *ctx)
+ 			yoff = wp->yoff - 1;
+ 		else
+ 			yoff = wp->yoff + wp->sy;
+-		xoff = wp->xoff + 2;
++		xoff = wp->xoff - wp->padding + 2;
+ 
+ 		if (xoff + (int)size <= ctx->ox ||
+ 		    xoff >= ctx->ox + (int)ctx->sx ||
+@@ -1202,20 +1205,20 @@ screen_redraw_get_visible_ranges(struct window_pane *base_wp, int px,
+ 		for (i = 0; i < r->used; i++) {
+ 			ri = &r->ranges[i];
+ 			if (w->sb_pos == PANE_SCROLLBARS_LEFT) {
+-				if (wp->xoff > sb_w)
+-					lb = wp->xoff - 1 - sb_w;
++			if (wp->xoff - wp->padding > sb_w)
++				lb = wp->xoff - wp->padding - 1 - sb_w;
+ 				else
+ 					lb = 0;
+ 			} else { /* PANE_SCROLLBARS_RIGHT or none. */
+-				if (wp->xoff > 0)
+-					lb = wp->xoff - 1;
++			if (wp->xoff - wp->padding > 0)
++				lb = wp->xoff - wp->padding - 1;
+ 				else
+ 					lb = 0;
+ 			}
+ 			if (w->sb_pos == PANE_SCROLLBARS_LEFT)
+-				rb = wp->xoff + wp->sx;
++			rb = wp->xoff + wp->sx + wp->padding;
+ 			else /* PANE_SCROLLBARS_RIGHT or none. */
+-				rb = wp->xoff + wp->sx + sb_w;
++			rb = wp->xoff + wp->sx + wp->padding + sb_w;
+ 			if (rb > (int)w->sx)
+ 				rb = w->sx - 1;
+ 
+@@ -1282,6 +1285,79 @@ empty:
+ 	return (r);
+ }
+ 
++/* Draw blank padding cells on one side of a pane for a single row. */
++static void
++screen_redraw_draw_pane_padding_side(struct screen_redraw_ctx *ctx,
++    struct window_pane *wp, int wx, u_int width, int wy, u_int py,
++    struct grid_cell *defaults)
++{
++	struct client		*c = ctx->c;
++	struct tty		*tty = &c->tty;
++	struct visible_ranges	*r;
++	struct visible_range	*ri;
++	u_int			 k, wxi;
++	int			 px, ox = ctx->ox;
++
++	if (width == 0)
++		return;
++	r = tty_check_overlay_range(tty, wx, wy, width);
++	r = screen_redraw_get_visible_ranges(wp, wx, wy, width, r);
++	for (k = 0; k < r->used; k++) {
++		ri = &r->ranges[k];
++		if (ri->nx == 0)
++			continue;
++		for (wxi = ri->px; wxi < ri->px + ri->nx; wxi++) {
++			if (!screen_redraw_is_visible(r, wxi))
++				continue;
++			px = wxi + ox;
++			if (px < 0 || (u_int)px >= tty->sx)
++				continue;
++			tty_cursor(tty, px, py);
++			tty_cell(tty, &grid_default_cell, defaults,
++			    &wp->palette, NULL);
++		}
++	}
++}
++
++/* Draw blank padding regions on both sides of a pane. */
++static void
++screen_redraw_draw_pane_padding(struct screen_redraw_ctx *ctx,
++    struct window_pane *wp)
++{
++	struct tty		*tty = &ctx->c->tty;
++	struct grid_cell	 defaults;
++	int			 pad = wp->padding;
++	int			 ox = ctx->ox, oy = ctx->oy;
++	int			 sy = tty->sy - ctx->statuslines;
++	int			 woy, wx_left, wx_right;
++	u_int			 j, wy, py;
++
++	if (pad <= 0 || !window_pane_visible(wp))
++		return;
++
++	if (ctx->statustop)
++		woy = ctx->statuslines;
++	else
++		woy = 0;
++
++	tty_default_colours(&defaults, wp);
++	wx_left = wp->xoff - pad;
++	wx_right = wp->xoff + wp->sx;
++
++	for (j = 0; j < wp->sy; j++) {
++		if (wp->yoff + (int)j < oy || wp->yoff + (int)j >= oy + sy)
++			continue;
++		wy = wp->yoff + j;
++		py = woy + wy - oy;
++		if (py >= tty->sy)
++			continue;
++		screen_redraw_draw_pane_padding_side(ctx, wp, wx_left, pad,
++		    wy, py, &defaults);
++		screen_redraw_draw_pane_padding_side(ctx, wp, wx_right, pad,
++		    wy, py, &defaults);
++	}
++}
++
+ /* Draw one pane. */
+ static void
+ screen_redraw_draw_pane(struct screen_redraw_ctx *ctx, struct window_pane *wp)
+@@ -1296,6 +1372,7 @@ screen_redraw_draw_pane(struct screen_redraw_ctx *ctx, struct window_pane *wp)
+ 	struct visible_ranges	*r;
+ 	struct visible_range	*ri;
+ 
++	screen_redraw_draw_pane_padding(ctx, wp);
+ 	/*
+ 	 * There are 3 coordinate spaces:
+ 	 *
+@@ -1440,9 +1517,9 @@ screen_redraw_draw_pane_scrollbar(struct screen_redraw_ctx *ctx,
+ 	}
+ 
+ 	if (sb_pos == PANE_SCROLLBARS_LEFT)
+-		sb_x = xoff - sb_w - sb_pad;
++		sb_x = xoff - sb_w - sb_pad - wp->padding;
+ 	else
+-		sb_x = xoff + wp->sx;
++		sb_x = xoff + wp->sx + wp->padding;
+ 
+ 	if (slider_h < 1)
+ 		slider_h = 1;
+@@ -1547,7 +1624,7 @@ screen_redraw_draw_scrollbar(struct screen_redraw_ctx *ctx,
+ 		for (i = imin; i < imax; i++) {
+ 			px = sb_x + ox + i; /* tty x coordinate */
+ 			wx = sb_x + i; /* window x coordinate */
+-			if (wx < xoff - (int)sb_w - (int)sb_pad ||
++		if (wx < xoff - (int)sb_w - (int)sb_pad - wp->padding ||
+ 			    px >= sx || px < 0 ||
+ 			    wy < yoff - 1 ||
+ 			    py >= sy || py < 0 ||
+diff --git a/server-client.c b/server-client.c
+index 52886f01..e75e5fec 100644
+--- a/server-client.c
++++ b/server-client.c
+@@ -624,7 +624,7 @@ server_client_check_mouse_in_pane(struct window_pane *wp, int px, int py,
+ 		pane_status_line = wp->yoff + wp->sy;
+ 	else
+ 		pane_status_line = -1; /* not used */
+-	bdr_left = wp->xoff - 1;
++	bdr_left = wp->xoff - wp->padding - 1;
+ 	if (w->sb_pos == PANE_SCROLLBARS_LEFT)
+ 		bdr_left -= sb_pad + sb_w;
+ 
+@@ -634,16 +634,16 @@ server_client_check_mouse_in_pane(struct window_pane *wp, int px, int py,
+ 	    (wp->yoff == 0 && py < (int)wp->sy) ||
+ 	    (py >= wp->yoff && py < wp->yoff + (int)wp->sy)) &&
+ 	    ((w->sb_pos == PANE_SCROLLBARS_RIGHT &&
+-	    px < wp->xoff + (int)wp->sx + sb_pad + sb_w) ||
++	    px < wp->xoff + (int)wp->sx + wp->padding + sb_pad + sb_w) ||
+ 	    (w->sb_pos == PANE_SCROLLBARS_LEFT &&
+-	    px < wp->xoff + (int)wp->sx - sb_pad - sb_w))) {
++	    px < wp->xoff + (int)wp->sx + wp->padding - sb_pad - sb_w))) {
+ 		/* Check if in the scrollbar. */
+ 		if ((w->sb_pos == PANE_SCROLLBARS_RIGHT &&
+-		    (px >= wp->xoff + (int)wp->sx + sb_pad &&
+-		    px < wp->xoff + (int)wp->sx + sb_pad + sb_w)) ||
++		    (px >= wp->xoff + (int)wp->sx + wp->padding + sb_pad &&
++		    px < wp->xoff + (int)wp->sx + wp->padding + sb_pad + sb_w)) ||
+ 		    (w->sb_pos == PANE_SCROLLBARS_LEFT &&
+-		    (px >= wp->xoff - sb_pad - sb_w &&
+-		    px < wp->xoff - sb_pad))) {
++		    (px >= wp->xoff - sb_pad - sb_w - wp->padding &&
++		    px < wp->xoff - sb_pad - wp->padding))) {
+ 			/* Check where inside the scrollbar. */
+ 			sl_top = wp->yoff + wp->sb_slider_y;
+ 			sl_bottom = (wp->yoff + wp->sb_slider_y +
+@@ -680,13 +680,14 @@ server_client_check_mouse_in_pane(struct window_pane *wp, int px, int py,
+ 			}
+ 			bdr_top = fwp->yoff - 1;
+ 			bdr_bottom = fwp->yoff + fwp->sy;
+-			bdr_left = fwp->xoff - 1;
++			bdr_left = fwp->xoff - fwp->padding - 1;
+ 			if (w->sb_pos == PANE_SCROLLBARS_LEFT) {
+ 				bdr_left -= sb_pad + sb_w;
+-				bdr_right = fwp->xoff + fwp->sx;
++				bdr_right = fwp->xoff + fwp->sx + fwp->padding;
+ 			} else {
+ 				/* PANE_SCROLLBARS_RIGHT or none. */
+-				bdr_right = fwp->xoff + fwp->sx + sb_pad + sb_w;
++				bdr_right = fwp->xoff + fwp->sx + fwp->padding +
++				    sb_pad + sb_w;
+ 			}
+ 			if (py >= fwp->yoff - 1 &&
+ 			    py <= fwp->yoff + (int)fwp->sy) {
+@@ -698,7 +699,7 @@ server_client_check_mouse_in_pane(struct window_pane *wp, int px, int py,
+ 						break;
+ 				}
+ 			}
+-			if (px >= bdr_left && px <= fwp->xoff + (int)fwp->sx) {
++			if (px >= bdr_left && px <= fwp->xoff + (int)fwp->sx + fwp->padding) {
+ 				bdr_bottom = fwp->yoff + fwp->sy;
+ 				if (py == bdr_bottom)
+ 					break;
+diff --git a/tmux.1 b/tmux.1
+index f0dafb1a..9765f0d8 100644
+--- a/tmux.1
++++ b/tmux.1
+@@ -5544,6 +5544,20 @@ Other attributes are ignored.
+ .Xc
+ Sets which side of the pane to display pane scrollbars on.
+ .Pp
++.It Ic pane\-padding Ar number
++Reserves
++.Ar number
++blank columns of padding on each side of every pane's content, drawn with the
++pane default background.
++The pane content is shifted right by
++.Ar number
++columns and narrowed by twice
++.Ar number ,
++but the pane borders, scrollbars and layout cell sizes are unchanged.
++The value is clamped to between 0 and 20 and may be reduced for panes too
++narrow to fit the padding while keeping at least one content column.
++A value of 0 leaves pane geometry unchanged.
++.Pp
+ .It Ic pane\-status\-current\-style Ar style
+ Set status line style for the currently active pane.
+ For how to specify
+diff --git a/tmux.h b/tmux.h
+index 5dc86b2b..9c1c8ee3 100644
+--- a/tmux.h
++++ b/tmux.h
+@@ -1338,6 +1338,7 @@ struct window_pane {
+ 	int		 control_fg;
+ 
+ 	struct style	 scrollbar_style;
++	int		 padding;	/* effective horizontal content padding */
+ 
+ 	struct visible_ranges r;
+ 
+@@ -3499,6 +3500,7 @@ void		 window_set_fill_character(struct window *);
+ void		 window_pane_default_cursor(struct window_pane *);
+ int		 window_pane_mode(struct window_pane *);
+ int		 window_pane_show_scrollbar(struct window_pane *);
++int		 window_pane_padding(struct window_pane *);
+ int		 window_pane_get_bg(struct window_pane *);
+ int		 window_pane_get_fg(struct window_pane *);
+ int		 window_pane_get_fg_control_client(struct window_pane *);
+diff --git a/window.c b/window.c
+index 00ed1a07..1d8bf681 100644
+--- a/window.c
++++ b/window.c
+@@ -1478,11 +1478,11 @@ window_pane_full_size_offset(struct window_pane *wp, int *xoff, int *yoff,
+ 	else
+ 		sb_w = 0;
+ 	if (w->sb_pos == PANE_SCROLLBARS_LEFT) {
+-		*xoff = wp->xoff - sb_w;
+-		*sx = wp->sx + sb_w;
++		*xoff = wp->xoff - sb_w - wp->padding;
++		*sx = wp->sx + sb_w + 2 * wp->padding;
+ 	} else { /* w->sb_pos == PANE_SCROLLBARS_RIGHT */
+-		*xoff = wp->xoff;
+-		*sx = wp->sx + sb_w;
++		*xoff = wp->xoff - wp->padding;
++		*sx = wp->sx + sb_w + 2 * wp->padding;
+ 	}
+ 	*yoff = wp->yoff;
+ 	*sy = wp->sy;
+@@ -1908,6 +1908,20 @@ window_pane_show_scrollbar(struct window_pane *wp)
+ 	return (0);
+ }
+ 
++/* Return the configured pane-padding option, clamped to its allowed range. */
++int
++window_pane_padding(struct window_pane *wp)
++{
++	int	pad;
++
++	pad = options_get_number(wp->options, "pane-padding");
++	if (pad < 0)
++		pad = 0;
++	if (pad > 20)
++		pad = 20;
++	return (pad);
++}
++
+ int
+ window_pane_get_bg(struct window_pane *wp)
+ {

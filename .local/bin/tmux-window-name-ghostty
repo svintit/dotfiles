@@ -1,0 +1,398 @@
+#!/usr/bin/env python3
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+HOME = str(Path.home())
+
+GAP_TITLE = "__gap__"
+GENERIC_TITLES = {"", "fish", "bash", "zsh", "sh", "node", "python", "ruby", "irb", "shell", "src"}
+HOSTNAME_LIKE_RE = re.compile(r'^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$')
+AGENT_COMMANDS = {"pi", "omp", "claude", "node"}
+MAX_TITLE_LEN = 80
+SUSPICIOUS_TITLE_RE = re.compile(r'^[A-Za-z0-9+/=_:;.,-]{120,}$')
+STATUS_SIGNALS = {
+    'asking': '#[fg=#f59e0b]?#[default]',
+    'working': '#[fg=#f59e0b]⠖#[default]',
+    'clock': '#[fg=#f59e0b]⏱#[default]',
+    'blocked': '#[fg=#f59e0b]◆#[default]',
+    'done': '#[fg=#22c55e]✓#[default]',
+    'stopped': '#[fg=#ff4d6d]■#[default]',
+    'idle': '#[fg=#5c5c7a]○#[default]',
+    'unknown': '#[fg=#5c5c7a]·#[default]',
+}
+
+
+def run(cmd, cwd=None):
+    result = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=1, check=False)
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def list_panes(window_id: str):
+    # Keep a sentinel field at the end so subprocess stdout trimming cannot drop
+    # meaningful empty trailing tmux option fields, for example empty @pi_sidebar_kind.
+    fmt = '#{pane_active}\t#{pane_title}\t#{pane_current_path}\t#{pane_start_path}\t#{pane_current_command}\t#{@pi_session_name}\t#{@pi_agent_status}\t#{@pi_slack_thread_user}\t#{@pi_sidebar_kind}\t__end__'
+    out = run(['tmux', 'list-panes', '-t', window_id, '-F', fmt])
+    return parse_pane_lines(out)
+
+
+COMBINED_FMT = '#{window_id}\t#{window_name}\t#{@pi_window_title}\t#{@pi_window_signal}\t#{@pi_agent_indicator}\t#{pane_active}\t#{pane_title}\t#{pane_current_path}\t#{pane_start_path}\t#{pane_current_command}\t#{@pi_session_name}\t#{@pi_agent_status}\t#{@pi_slack_thread_user}\t#{@pi_sidebar_kind}\t__end__'
+
+
+def parse_pane_lines(out: str):
+    panes = []
+    for line in out.splitlines():
+        parts = line.split('\t')
+        if len(parts) != 10:
+            continue
+        active, title, path, start_path, command, pi_name, pi_status, slack_user, sidebar_kind, _end = parts
+        panes.append({
+            'active': active == '1',
+            'title': title,
+            'path': path,
+            'start_path': start_path,
+            'command': command,
+            'pi_session_name': pi_name.strip() if pi_name else '',
+            'pi_agent_status': normalize_agent_status(pi_status),
+            'pi_slack_thread_user': clean_slack_user(slack_user),
+            'pi_sidebar_kind': sidebar_kind.strip() if sidebar_kind else '',
+        })
+    return panes
+
+
+def real_panes(panes):
+    return [p for p in panes if p.get('pi_sidebar_kind') != 'pi-sidebar' and p['title'] != GAP_TITLE]
+
+
+def pick_pane(panes):
+    rp = real_panes(panes)
+    if not rp:
+        return panes[0] if panes else None
+    for pane in rp:
+        if pane['active']:
+            return pane
+    return rp[0]
+
+
+def looks_like_transport_payload(title: str) -> bool:
+    lowered = title.lower().strip()
+    if len(lowered) < 120:
+        return False
+    if lowered.startswith('gm=') or lowered.endswith('jru5erkjggg=='):
+        return True
+    return bool(SUSPICIOUS_TITLE_RE.fullmatch(lowered))
+
+
+
+def normalize_agent_status(raw: str) -> str:
+    status = (raw or '').strip().lower()
+    if status == 'asking':
+        return 'asking'
+    if status == 'clock':
+        return 'clock'
+    if status in {'working', 'running'}:
+        return 'working'
+    if status in {'done', 'completed', 'complete'}:
+        return 'done'
+    if status in {'blocked', 'needs_input', 'waiting'}:
+        return 'blocked'
+    if status in {'error', 'errored', 'aborted', 'stopped'}:
+        return 'stopped'
+    if status in {'idle'}:
+        return 'idle'
+    if status in {'unknown'}:
+        return 'unknown'
+    return ''
+
+
+
+def agent_status_for_pane(pane) -> str:
+    if not pane or pane.get('command') not in AGENT_COMMANDS:
+        return ''
+    return pane.get('pi_agent_status', '')
+
+
+
+def visible_len(text: str) -> int:
+    return len(re.sub(r'#\[[^\]]*\]', '', text or ''))
+
+
+def signal_for_status(status: str) -> str:
+    return STATUS_SIGNALS.get(status, '')
+
+
+def sync_window_indicator(window_id: str, title: str, status: str) -> None:
+    run(['tmux', 'set-option', '-wq', '-t', window_id, '@pi_window_title', title])
+    signal = signal_for_status(status)
+    if signal:
+        run(['tmux', 'set-option', '-wq', '-t', window_id, '@pi_window_signal', signal])
+    else:
+        run(['tmux', 'set-option', '-wqu', '-t', window_id, '@pi_window_signal'])
+    run(['tmux', 'set-option', '-wqu', '-t', window_id, '@pi_agent_indicator'])
+
+
+
+def clean_title(raw: str) -> str:
+    title = (raw or '').strip()
+    if not title:
+        return ''
+    if '|' in title:
+        title = title.split('|')[-1].strip()
+    if looks_like_transport_payload(title):
+        return ''
+    # Strip Pi/OMP pane title prefixes: "π - <name> - <dir>", "π: <name>", "π- <name>"
+    if title.startswith('π - '):
+        parts = title.split(' - ')
+        if len(parts) >= 3:
+            title = ' - '.join(parts[1:-1]).strip()
+        else:
+            title = title[4:].strip()
+    elif title.startswith('π: '):
+        title = title[3:].strip()
+    elif title.startswith('π- '):
+        title = title[3:].strip()
+    title = title.lstrip('^*+~-=_:;,.[](){}<>⭐✨🌟🔥✅❇✳⠂⠐•· \'"')
+    title = title.strip()
+    if title.lower() in GENERIC_TITLES:
+        return ''
+    if not title:
+        return ''
+    # Reject hostname-like strings (e.g. macbook-pro-8.local)
+    if HOSTNAME_LIKE_RE.fullmatch(title.lower()):
+        return ''
+    if len(title) > MAX_TITLE_LEN:
+        title = title[:MAX_TITLE_LEN].rstrip('-')
+    return title
+
+def clean_slack_user(raw: str) -> str:
+    user = (raw or '').strip().lstrip('@')
+    if not user:
+        return ''
+    user = re.sub(r'[^A-Za-z0-9._-]+', '-', user).strip('-')
+    if len(user) > 40:
+        user = user[:40].rstrip('-')
+    return user
+
+def pane_display_name(pane: dict) -> str:
+    """Get display name for a pane: prefer @pi_session_name, fall back to clean_title."""
+    pi_name = pane.get('pi_session_name', '')
+    if pi_name and pi_name not in GENERIC_TITLES and not HOSTNAME_LIKE_RE.fullmatch(pi_name):
+        return pi_name
+    # Slack-tracked Pi panes set the terminal title to the Slack session ID for
+    # /resume. Do not use that as the tab summary. Wait for @pi_session_name to
+    # contain a generated conversation summary instead.
+    if pane.get('pi_slack_thread_user'):
+        return ''
+    return clean_title(pane['title'])
+
+def pick_agent_like_pane(panes):
+    rp = real_panes(panes)
+    # Prefer panes with @pi_session_name set (most reliable with Ghostty)
+    for pane in rp:
+        if pane['command'] in AGENT_COMMANDS and pane.get('pi_session_name'):
+            name = pane['pi_session_name']
+            if name and name not in GENERIC_TITLES and not HOSTNAME_LIKE_RE.fullmatch(name):
+                return pane
+    for pane in rp:
+        if pane['command'] in AGENT_COMMANDS and clean_title(pane['title']):
+            return pane
+    for pane in rp:
+        if pane_display_name(pane):
+            return pane
+    return None
+
+def is_nix_store_path(cwd: str) -> bool:
+    return cwd == '/nix/store' or cwd.startswith('/nix/store/')
+
+
+
+def effective_cwd(pane: dict) -> str:
+    path = pane.get('path') or ''
+    start_path = pane.get('start_path') or ''
+    if is_nix_store_path(path) and start_path and not is_nix_store_path(start_path):
+        return start_path
+    return path or start_path or HOME
+
+
+
+def dir_name_for(cwd: str):
+    if cwd == HOME:
+        return '~'
+    if cwd.startswith(HOME + '/'):
+        return '~/' + cwd[len(HOME) + 1:]
+    if is_nix_store_path(cwd):
+        return ''
+    return cwd
+
+
+
+def format_composite_name(left: str, right: str) -> str:
+    left = (left or '').strip()
+    right = (right or '').strip()
+    if '/' in left:
+        basename = os.path.basename(left.rstrip('/'))
+        left = '' if '.' in basename else basename
+    if left == 'src':
+        left = ''
+    if left and right:
+        return f"{left} // {right}"
+    return right or left
+
+def sanitize_current_name(raw: str) -> str:
+    name = (raw or '').strip()
+    if not name:
+        return ''
+    if ' // ' in name:
+        left, right = name.split(' // ', 1)
+        cleaned_right = clean_title(right)
+        name = format_composite_name(left, cleaned_right)
+    if looks_like_transport_payload(name):
+        return ''
+    if len(name) > MAX_TITLE_LEN + 20:
+        return ''
+    return name
+
+
+GENERIC_FALLBACK_TITLES = {'macbook-pro-8.local', 'localhost', 'fish', 'bash', 'zsh', 'sh', 'node', 'python', 'shell'}
+
+
+def compute_window_name(panes, current_name: str):
+    safe_current_name = sanitize_current_name(current_name)
+    pane = pick_pane(panes)
+    if not pane:
+        return safe_current_name or 'shell', ''
+
+    agent_pane = pick_agent_like_pane(panes)
+    status = agent_status_for_pane(agent_pane)
+    cwd_source = agent_pane or pane
+    cwd = effective_cwd(cwd_source)
+    dir_name = agent_pane.get('pi_slack_thread_user') if agent_pane else ''
+    if not dir_name:
+        dir_name = dir_name_for(cwd)
+    command = pane['command'] or ''
+
+    display_name = ''
+    if agent_pane:
+        display_name = pane_display_name(agent_pane)
+    if not display_name:
+        display_name = pane_display_name(pane)
+
+    next_name = ''
+    if display_name:
+        next_name = format_composite_name(dir_name, display_name)
+    else:
+        if agent_pane and agent_pane.get('pi_slack_thread_user') and dir_name:
+            next_name = dir_name
+        elif safe_current_name and safe_current_name.lower() not in GENERIC_FALLBACK_TITLES:
+            next_name = safe_current_name
+        elif dir_name:
+            next_name = dir_name
+        elif command:
+            next_name = command
+        else:
+            next_name = safe_current_name or 'shell'
+
+    return next_name, status
+
+
+def tmux_quote(s: str) -> str:
+    # Escape for tmux's double-quoted parser: $vars, ~home, \n\r\t\e, \uXXXX,
+    # \ooo are all expanded. Double backslash first; convert control chars.
+    s = s.replace('\\', '\\\\')
+    s = s.replace('"', '\\"')
+    s = s.replace('$', '\\$')
+    s = s.replace('\n', '\\n')
+    s = s.replace('\r', '\\r')
+    s = s.replace('\t', '\\t')
+    s = s.replace('\x1b', '\\e')
+    if s.startswith('~'):
+        s = '\\~' + s[1:]
+    return '"' + s + '"'
+
+
+def parse_combined_lines(out: str):
+    windows = {}
+    for line in out.splitlines():
+        parts = line.split('\t')
+        if len(parts) != 15:
+            continue
+        wid, name, pi_title, pi_signal, pi_indicator, active, title, path, start_path, command, pi_name, pi_status, slack_user, sidebar_kind, _end = parts
+        if wid not in windows:
+            windows[wid] = {
+                'window_id': wid,
+                'name': name,
+                'pi_window_title': pi_title,
+                'pi_window_signal': pi_signal,
+                'pi_agent_indicator': pi_indicator,
+                'panes': [],
+            }
+        windows[wid]['panes'].append({
+            'active': active == '1',
+            'title': title,
+            'path': path,
+            'start_path': start_path,
+            'command': command,
+            'pi_session_name': pi_name.strip() if pi_name else '',
+            'pi_agent_status': normalize_agent_status(pi_status),
+            'pi_slack_thread_user': clean_slack_user(slack_user),
+            'pi_sidebar_kind': sidebar_kind.strip() if sidebar_kind else '',
+        })
+    return windows
+
+
+def batch_refresh():
+    out = run(['tmux', 'list-panes', '-a', '-F', COMBINED_FMT])
+    if not out:
+        return
+    windows = parse_combined_lines(out)
+    if not windows:
+        return
+
+    commands = []
+    for wid, w in windows.items():
+        panes = w['panes']
+        if not panes:
+            continue
+        next_name, status = compute_window_name(panes, w['name'])
+        if not next_name:
+            continue
+        desired_signal = signal_for_status(status)
+        if next_name != w['name']:
+            commands.append(f'rename-window -t {wid} {tmux_quote(next_name)}')
+        if next_name != w['pi_window_title']:
+            commands.append(f'set-option -wq -t {wid} @pi_window_title {tmux_quote(next_name)}')
+        if desired_signal != w['pi_window_signal']:
+            if desired_signal:
+                commands.append(f'set-option -wq -t {wid} @pi_window_signal {tmux_quote(desired_signal)}')
+            else:
+                commands.append(f'set-option -wqu -t {wid} @pi_window_signal')
+        if w['pi_agent_indicator']:
+            commands.append(f'set-option -wqu -t {wid} @pi_agent_indicator')
+
+    if commands:
+        try:
+            subprocess.run(['tmux', 'source-file', '-'], input='\n'.join(commands) + '\n',
+                            capture_output=True, text=True, timeout=1, check=False)
+        except Exception:
+            pass
+
+
+def main():
+    window_id = sys.argv[1] if len(sys.argv) > 1 else '@0'
+    current_name = sys.argv[2] if len(sys.argv) > 2 else ''
+    panes = list_panes(window_id)
+    if not panes:
+        print(sanitize_current_name(current_name) or 'shell')
+        return
+    next_name, status = compute_window_name(panes, current_name)
+    sync_window_indicator(window_id, next_name, status)
+    print(next_name)
+
+
+if __name__ == '__main__':
+    if len(sys.argv) > 1 and sys.argv[1] == '--batch':
+        batch_refresh()
+    else:
+        main()

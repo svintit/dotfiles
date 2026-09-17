@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+client=${TMUX_CONTEXT_CLIENT:-${TMUX_TARGET_CLIENT:-}}
+tty=${TMUX_CONTEXT_TTY:-${TMUX_TARGET_TTY:-}}
+session=${TMUX_CONTEXT_SESSION:-}
+window=${TMUX_CONTEXT_WINDOW:-}
+pane=${TMUX_CONTEXT_PANE:-}
+cwd=${TMUX_TARGET_PATH:-${TMUX_CONTEXT_PATH:-$PWD}}
+timeout=${TMUX_DOUBLE_SECTION_TIMEOUT:-0.16}
+
+safe_client=$(printf '%s' "${client:-${tty:-default}}" | tr -c 'A-Za-z0-9._-' '_')
+pending="/tmp/tmux-sesh-double-section-${safe_client:-default}"
+
+# Double § -> the pretty rectangular fzf popup (same one the "new session"
+# item in our custom native-menu popup opens), skipping straight past the
+# plain native tmux-menu list. NOT sesh's own built-in "sesh picker" TUI.
+# tmux-open-sesh-popup (native menu) and sesh-tmux-popup are untouched on
+# disk if this needs reverting.
+open_sesh() {
+  exec env \
+    TMUX_TARGET_CLIENT="$tty" \
+    TMUX_TARGET_PATH="$cwd" \
+    "$HOME/.local/bin/tmux-open-sesh-fzf-popup"
+}
+
+open_popup() {
+  env \
+    TMUX_CONTEXT_SESSION="$session" \
+    TMUX_CONTEXT_CLIENT="$client" \
+    TMUX_CONTEXT_TTY="$tty" \
+    TMUX_CONTEXT_WINDOW="$window" \
+    TMUX_CONTEXT_PANE="$pane" \
+    TMUX_CONTEXT_PATH="$cwd" \
+    "$HOME/.local/bin/tmux-popup-toggle-ghostty"
+}
+
+if [ -f "$pending" ]; then
+  rm -f "$pending"
+  open_sesh
+fi
+
+: > "$pending"
+(
+  sleep "$timeout"
+  if [ -f "$pending" ]; then
+    rm -f "$pending"
+    open_popup
+  fi
+) >/dev/null 2>&1 &

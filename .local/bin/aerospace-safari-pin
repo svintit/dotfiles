@@ -1,0 +1,18 @@
+#!/bin/sh
+# Runs on every on-focus-changed event. on-window-detected never fires for
+# Safari because AeroSpace restores reopened windows from its closed-window
+# cache, which skips on-window-detected. This checks the focus target instead.
+AEROSPACE=/opt/homebrew/bin/aerospace
+[ -n "$AEROSPACE_WINDOW_ID" ] || exit 0
+
+bundle_id="$($AEROSPACE echo --window-id "$AEROSPACE_WINDOW_ID" -- %{app-bundle-id} 2>/dev/null)"
+[ "$bundle_id" = "com.apple.Safari" ] || exit 0
+
+# Native fullscreen windows must stay outside the tiling tree. Otherwise,
+# Safari reserves a tile on B1 while macOS shows it in a fullscreen Space.
+$AEROSPACE layout floating --window-id "$AEROSPACE_WINDOW_ID" >/dev/null 2>&1 || exit 1
+
+workspace="$($AEROSPACE echo --window-id "$AEROSPACE_WINDOW_ID" -- %{workspace} 2>/dev/null)"
+[ "$workspace" = "B1" ] && exit 0
+
+$AEROSPACE move-node-to-workspace B1 --window-id "$AEROSPACE_WINDOW_ID" >/dev/null 2>&1

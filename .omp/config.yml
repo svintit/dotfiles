@@ -1,0 +1,57 @@
+modelRoles:
+  task: fireworks/glm-5p2-fast:high
+  smol: google/gemini-3.1-flash-lite:max
+  tiny: google/gemini-3.1-flash-lite:max
+  slow: openai/gpt-5.6-sol:medium
+  plan: anthropic/claude-opus-4-8:max
+  advisor: anthropic/claude-opus-4-8:max
+  designer: anthropic/claude-opus-4-8:max
+  vision: anthropic/claude-opus-4-8:max
+  default: fireworks/glm-5p2-fast:xhigh
+setupVersion: 1
+startup:
+  setupWizard: false
+  checkUpdate: false
+  quiet: true
+theme:
+  dark: dark
+  light: light
+defaultThinkingLevel: xhigh
+hideThinkingBlock: true
+statusLine:
+  showHookStatus: false
+  transparent: true
+compaction:
+  enabled: true
+  keepRecentTokens: 30000
+  reserveTokens: 20000
+retry:
+  enabled: true
+  maxRetries: 2
+  baseDelayMs: 1500
+advisor:
+  enabled: true
+providers:
+  webSearchOrder:
+    - perplexity
+    - gemini
+    - anthropic
+    - xai
+    - brave
+    - duckduckgo
+    - google
+git:
+  enabled: false
+dev:
+  autoqaConsent: denied
+display:
+  cacheMissMarker: true
+  shimmer: kitt
+tui:
+  textSizing: true
+  tight: false
+spelling:
+  typoDetection: false
+  autocorrect: false
+github:
+  enabled: false

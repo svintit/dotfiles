@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ORIENTATION=${1:?orientation required}
+CURRENT_PANE=$(tmux display-message -p '#{pane_id}')
+HORIZONTAL_BEFORE_FLAG=()
+pi_pid() {
+  # Resolve the pi process for this pane. pane_pid is the pane's shell, while pi
+  # usually runs as a child of it, so find the pi process on the pane's tty.
+  local tty
+  tty=$(tmux display-message -p -t "$CURRENT_PANE" '#{pane_tty}' 2>/dev/null)
+  tty=${tty#/dev/}
+  if [ -n "$tty" ]; then
+    ps -t "$tty" -o pid=,comm= 2>/dev/null \
+      | awk '{n=split($2,a,"/"); if (a[n]=="pi") {print $1; exit}}'
+  fi
+}
+pane_is_pi_or_omp() {
+  local cmd title status
+  cmd=$(tmux display-message -p -t "$CURRENT_PANE" '#{pane_current_command}' 2>/dev/null)
+  case "$cmd" in pi|omp) return 0 ;; esac
+  title=$(tmux display-message -p -t "$CURRENT_PANE" '#{pane_title}' 2>/dev/null)
+  case "$title" in π*) return 0 ;; esac
+  status=$(tmux show-options -vt "$CURRENT_PANE" @pi_agent_status 2>/dev/null)
+  [ -n "$status" ]
+}
+if pane_is_pi_or_omp; then
+  HORIZONTAL_BEFORE_FLAG=(-b)
+fi
+# New splits inherit the originating pane's current directory.
+# For pi panes, pane_current_path tracks the launching shell and pi's OS process
+# cwd stays at the launch dir, neither of which is pi's *active worktree* context
+# (set via the git-statusline extension / set_status_worktree). The extension
+# writes that active worktree cwd to ~/.pi/active-worktree/<pid>, so prefer it,
+# then fall back to pi's process cwd, then pane_current_path.
+SOURCE_CWD=$(tmux display-message -p '#{pane_current_path}')
+PI_PID=$(pi_pid)
+if [ -n "$PI_PID" ]; then
+  ACTIVE_WORKTREE_FILE="$HOME/.pi/active-worktree/$PI_PID"
+  PI_CWD=""
+  if [ -r "$ACTIVE_WORKTREE_FILE" ]; then
+    PI_CWD=$(head -1 "$ACTIVE_WORKTREE_FILE" 2>/dev/null)
+  fi
+  if [ -z "${PI_CWD:-}" ] || [ ! -d "$PI_CWD" ]; then
+    PI_CWD=$(lsof -a -p "$PI_PID" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -1)
+  fi
+  if [ -n "${PI_CWD:-}" ] && [ -d "$PI_CWD" ]; then
+    SOURCE_CWD="$PI_CWD"
+  fi
+fi
+
+
+# fish force-cd's interactive shells to a default dir unless QUICK_SPLIT_DIR is
+# set, so pass the desired dir both as the start dir (-c) and via env (-e).
+case "$ORIENTATION" in
+  h)
+    NEW_PANE=$(tmux split-window -d -P -F '#{pane_id}' -t "$CURRENT_PANE" "${HORIZONTAL_BEFORE_FLAG[@]}" -h -c "$SOURCE_CWD" -e "QUICK_SPLIT_DIR=$SOURCE_CWD")
+    ;;
+  v)
+    NEW_PANE=$(tmux split-window -d -P -F '#{pane_id}' -t "$CURRENT_PANE" -v -c "$SOURCE_CWD" -e "QUICK_SPLIT_DIR=$SOURCE_CWD")
+    ;;
+  *)
+    echo "Invalid orientation: $ORIENTATION" >&2
+    exit 1
+    ;;
+esac
+
+tmux select-pane -t "$NEW_PANE"

@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+CLIENT=${TMUX_TARGET_CLIENT:-$(tmux display-message -p '#{client_tty}')}
+CWD=${TMUX_TARGET_PATH:-$(tmux display-message -p '#{pane_current_path}')}
+
+if [ "${1:-}" = "--warm" ]; then
+  "$HOME/.local/bin/sesh-tmux-popup" --warm >/dev/null 2>&1 || true
+  exit 0
+fi
+
+# Run directly inside display-popup. This avoids the attach-session path, which
+# is the remaining noticeable delay on both the sesh picker and the § popup.
+TMUX_TARGET_CLIENT_ESC=${CLIENT//\'/\'\\\'\'}
+COMMAND="exec env SESH_TMUX_DIRECT_POPUP=1 TMUX_TARGET_CLIENT='$TMUX_TARGET_CLIENT_ESC' '$HOME/.local/bin/sesh-tmux-popup'"
+
+tmux display-popup -E -c "$CLIENT" -w 35 -h 20 -x C -y C -d "$CWD" \
+  -T ' sesh ' -S 'fg=#ffcc66' -s 'bg=#0a0c14,fg=#e0e0e0' \
+  "$COMMAND"

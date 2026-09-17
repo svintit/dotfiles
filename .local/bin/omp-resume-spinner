@@ -1,0 +1,273 @@
+#!/usr/bin/env python3
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import textwrap
+import time
+
+ALT_SCREEN = "\033[?1049h"
+MAIN_SCREEN = "\033[?1049l"
+HIDE_CURSOR = "\033[?25l"
+SHOW_CURSOR = "\033[?25h"
+HOME = "\033[H"
+CLEAR = "\033[2J"
+RESET = "\033[0m"
+BOLD = "\033[1m"
+BG = "\033[48;2;8;10;18m"
+BORDER = "\033[38;2;71;85;105m"
+CYAN = "\033[38;2;103;232;249m"
+VIOLET = "\033[38;2;192;132;252m"
+WHITE = "\033[38;2;226;232;240m"
+MUTED = "\033[38;2;100;116;139m"
+PURPLE = "\033[38;2;192;133;252m"
+OPTICAL_VERTICAL_OFFSET = 3
+
+LOGO = (
+    " ██████╗ ███╗   ███╗██████╗ ",
+    "██╔═══██╗████╗ ████║██╔══██╗",
+    "██║   ██║██╔████╔██║██████╔╝",
+    "██║   ██║██║╚██╔╝██║██╔═══╝ ",
+    "╚██████╔╝██║ ╚═╝ ██║██║     ",
+    " ╚═════╝ ╚═╝     ╚═╝╚═╝     ",
+)
+FRAMES = ("⠖", "⠲", "⢲", "⢰", "⣰", "⣠", "⣄", "⣆", "⡆", "⡖")
+pane = os.environ.get("TMUX_PANE")
+mode = "frozen" if "--frozen" in sys.argv[1:] else "resuming"
+started = False
+handed_off = False
+frozen_summary = ""
+frozen_elapsed = ""
+
+
+def write(text: str) -> None:
+    sys.stdout.write(text)
+    sys.stdout.flush()
+
+
+def restore_screen(*_args: object) -> None:
+    if started and not handed_off:
+        write(RESET + SHOW_CURSOR + MAIN_SCREEN)
+    raise SystemExit(130)
+
+
+def pane_option(key: str) -> str:
+    return subprocess.run(
+        ["tmux", "show-option", "-pqv", "-t", pane, key],
+        capture_output=True,
+        text=True,
+        timeout=1,
+        check=False,
+    ).stdout.strip()
+
+
+def state() -> str:
+    return pane_option("@pi_freeze_state")
+
+
+def freeze_info():
+    fmt = "\x1f".join([
+        "#{@pi_freeze_state}",
+        "#{@pi_freeze_summary}",
+        "#{@pi_frozen_at}",
+        "#{@pi_session_name}",
+    ])
+    try:
+        result = subprocess.run(
+            ["tmux", "display-message", "-p", "-t", pane, fmt],
+            capture_output=True,
+            text=True,
+            timeout=1,
+            check=False,
+        )
+    except Exception:
+        return "", "", 0, ""
+    if result.returncode != 0:
+        return "", "", 0, ""
+    raw = result.stdout
+    if raw.endswith("\n"):
+        raw = raw[:-1]
+    parts = raw.split("\x1f")
+    if len(parts) != 4:
+        return "", "", 0, ""
+    try:
+        at_ms = int(parts[2].strip())
+    except ValueError:
+        at_ms = 0
+    return parts[0].strip(), parts[1].strip(), at_ms, parts[3].strip()
+
+
+def format_summary(value: str) -> str:
+    words = value.split()
+    if not words:
+        return "No recent session update is available."
+    return " ".join(words[:30]) + ("…" if len(words) > 30 else "")
+
+
+def elapsed_from(ts: int) -> str:
+    if not ts:
+        return ""
+    seconds = max(0, int(time.time() * 1000) - ts) / 1000
+    minutes = int(seconds // 60)
+    if minutes < 1:
+        return "Frozen for <1m"
+    if minutes < 60:
+        return f"Frozen for {minutes}m"
+    hours = minutes // 60
+    mins = minutes % 60
+    if hours < 24:
+        return f"Frozen for {hours}h {mins}m"
+    days = hours // 24
+    hrs = hours % 24
+    return f"Frozen for {days}d {hrs}h {mins}m"
+
+
+def place(row: int, text: str, width: int, color: str = WHITE) -> str:
+    visible = text[:width]
+    column = max(1, (width - len(visible)) // 2 + 1)
+    return f"\033[{row};{column}H{color}{visible}{RESET}{BG}"
+
+
+def place_styled(row: int, text: str, text_width: int, width: int) -> str:
+    column = max(1, (width - text_width) // 2 + 1)
+    return f"\033[{row};{column}H{text}{RESET}{BG}"
+
+
+def progress(frame: int, width: int) -> str:
+    track_width = max(10, min(32, width - 16))
+    position = frame % (track_width + 8) - 4
+    cells = []
+    for index in range(track_width):
+        distance = abs(index - position)
+        if distance == 0:
+            cells.append(f"{WHITE}━")
+        elif distance <= 2:
+            cells.append(f"{CYAN}━")
+        elif distance <= 4:
+            cells.append(f"{VIOLET}━")
+        else:
+            cells.append(f"{MUTED}·")
+    return "".join(cells) + RESET + BG
+
+def optically_centered_top(rows: int, content_height: int) -> int:
+    centered = (rows - content_height) // 2 + 1
+    last_valid_top = max(1, rows - content_height + 1)
+    return min(last_valid_top, max(1, centered + OPTICAL_VERTICAL_OFFSET))
+
+
+
+def render(frame: int, screen_mode: str) -> None:
+    try:
+        size = os.get_terminal_size(sys.stdout.fileno())
+    except OSError:
+        size = shutil.get_terminal_size((80, 24))
+    columns, rows = size.columns, size.lines
+    columns = max(24, columns)
+    rows = max(12, rows)
+
+    panel_width = min(columns - 6, 64)
+    summary_width = max(16, panel_width - 8)
+    full_summary_lines = (
+        textwrap.wrap(frozen_summary, width=summary_width)
+        if screen_mode == "frozen"
+        else []
+    )
+    elapsed_lines = 2 if frozen_elapsed else 0
+    panel_offset = (
+        max(17 + elapsed_lines, 15 + elapsed_lines + len(full_summary_lines))
+        if screen_mode == "frozen"
+        else 17
+    )
+    panel_height = panel_offset + 1
+    compact = columns < 52 or rows < panel_height + 2
+
+    output = [HOME, BG, CLEAR]
+    cursor_row = rows
+    if compact:
+        available_summary_rows = max(1, rows - 7)
+        summary_lines = (
+            textwrap.wrap(frozen_summary, width=max(16, columns - 6))[:available_summary_rows]
+            if screen_mode == "frozen"
+            else []
+        )
+        elapsed_compact = 1 if frozen_elapsed else 0
+        block_height = max(7 + elapsed_compact, 6 + elapsed_compact + len(summary_lines))
+        top = optically_centered_top(rows, block_height)
+        output.append(place(top, "OMP", columns, VIOLET))
+        if screen_mode == "frozen":
+            output.append(place(top + 2, "SESSION FROZEN", columns, WHITE))
+            output.append(place(top + 4, "Press Enter to resume", columns, BOLD + CYAN))
+            for index, line in enumerate(summary_lines):
+                output.append(place(top + 6 + index, line, columns, MUTED))
+            if frozen_elapsed:
+                output.append(place(top + 6 + len(summary_lines) + 1, frozen_elapsed, columns, PURPLE))
+        else:
+            output.append(place(top + 2, "RESTORING SESSION", columns, WHITE))
+            output.append(place(top + 4, f"{FRAMES[frame % len(FRAMES)]}  Starting OMP", columns, CYAN))
+            output.append(place(top + 6, "Your session state is safe", columns, MUTED))
+        cursor_row = min(rows, top + block_height)
+    else:
+        top = optically_centered_top(rows, panel_height)
+        left = max(2, (columns - panel_width) // 2 + 1)
+        right = left + panel_width - 1
+        bottom = top + panel_offset
+
+        output.append(f"\033[{top};{left}H{BORDER}╭{'─' * (panel_width - 2)}╮")
+        for row in range(top + 1, bottom):
+            output.append(f"\033[{row};{left}H│\033[{row};{right}H│")
+        output.append(f"\033[{bottom};{left}H╰{'─' * (panel_width - 2)}╯{RESET}{BG}")
+
+        logo_row = top + 2
+        for index, line in enumerate(LOGO):
+            color = CYAN if index < 3 else VIOLET
+            output.append(place(logo_row + index, line, columns, color))
+
+        status_row = logo_row + len(LOGO) + 1
+        track_width = max(10, min(32, columns - 16))
+        if screen_mode == "frozen":
+            output.append(place(status_row, "SESSION FROZEN", columns, WHITE))
+            output.append(place(status_row + 2, "Press Enter to resume", columns, BOLD + CYAN))
+            output.append(place(status_row + 4, "LAST SESSION UPDATE", columns, MUTED))
+            for index, line in enumerate(full_summary_lines):
+                output.append(place(status_row + 5 + index, line, columns, WHITE))
+            if frozen_elapsed:
+                output.append(place(status_row + 5 + len(full_summary_lines) + 1, frozen_elapsed, columns, PURPLE))
+        else:
+            output.append(place(status_row, "RESTORING SESSION", columns, WHITE))
+            output.append(place_styled(status_row + 2, progress(frame, columns), track_width, columns))
+            output.append(place(status_row + 4, f"{FRAMES[frame % len(FRAMES)]}  Starting OMP", columns, CYAN))
+            output.append(place(status_row + 6, "Your session state is safe", columns, MUTED))
+        cursor_row = min(rows, bottom + 1)
+
+    output.append(f"\033[{cursor_row};1H")
+    write("".join(output))
+
+
+if not pane:
+    raise SystemExit(0)
+
+if mode == "frozen":
+    _fz_state, _fz_summary, _fz_at, _fz_session = freeze_info()
+    frozen_summary = format_summary(_fz_summary or _fz_session)
+    frozen_elapsed = elapsed_from(_fz_at)
+signal.signal(signal.SIGTERM, restore_screen)
+signal.signal(signal.SIGINT, restore_screen)
+write(ALT_SCREEN + HIDE_CURSOR)
+started = True
+
+frame = 0
+try:
+    if mode == "frozen":
+        if _fz_state not in {"freezing", "frozen"}:
+            restore_screen()
+        render(0, mode)
+        handed_off = True
+    else:
+        while state() == "resuming":
+            render(frame, mode)
+            frame += 1
+            time.sleep(0.1)
+        handed_off = True
+except Exception:
+    restore_screen()

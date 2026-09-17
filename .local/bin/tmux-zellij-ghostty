@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:${PATH:-}"
+unset KITTY_LISTEN_ON KITTY_WINDOW_ID KITTY_PID KITTY_PUBLIC_KEY KITTY_INSTALLATION_DIR
+
+CONFIG="$HOME/.config/tmux/ghostty-parity.tmux.conf"
+SOCK="ghostty-main"
+SESSION="main"
+TMUX_BIN="${TMUX_BIN:-tmux}"
+if ! command -v "$TMUX_BIN" >/dev/null 2>&1; then
+  TMUX_BIN="/opt/homebrew/bin/tmux"
+fi
+
+if [ ! -f "$CONFIG" ]; then
+  echo "Missing tmux config: $CONFIG" >&2
+  exit 1
+fi
+
+# Disable XON/XOFF flow control so Ctrl-s reaches tmux instead of freezing output.
+stty -ixon 2>/dev/null || true
+
+if [ "$#" -eq 0 ]; then
+  # $HOME/.local/bin/tmux-refresh-window-names-ghostty "$SOCK" >/dev/null 2>&1 &
+  exec "$TMUX_BIN" -f "$CONFIG" -L "$SOCK" new-session -A -s "$SESSION"
+else
+  exec "$TMUX_BIN" -f "$CONFIG" -L "$SOCK" "$@"
+fi

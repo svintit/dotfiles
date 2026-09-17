@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROLE=${1:?role required}
+WIDTH=${2:-35}
+TITLE="assistant:${ROLE}"
+CURRENT_WINDOW=$(tmux display-message -p '#{window_id}')
+TARGET_PANE=$(tmux list-panes -a -F '#{pane_id}\t#{pane_title}\t#{window_id}' | awk -F '\t' -v title="$TITLE" -v win="$CURRENT_WINDOW" '$2 == title && $3 == win { print $1; exit }')
+
+if [ -z "${TARGET_PANE:-}" ]; then
+  exit 0
+fi
+
+WINDOW_WIDTH=$(tmux display-message -p '#{window_width}')
+TARGET_WIDTH=$(( WINDOW_WIDTH * WIDTH / 100 ))
+[ "$TARGET_WIDTH" -lt 20 ] && TARGET_WIDTH=20
+
+tmux resize-pane -t "$TARGET_PANE" -x "$TARGET_WIDTH"

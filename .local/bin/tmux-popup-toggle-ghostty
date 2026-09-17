@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+# Toggle a large centered tmux popup scoped to the current tmux window.
+set -euo pipefail
+
+CLIENT_TTY=${TMUX_CONTEXT_TTY:-$(tmux display-message -p "#{client_tty}")}
+CLIENT_NAME=${TMUX_CONTEXT_CLIENT:-$(tmux display-message -p "#{client_name}")}
+CURRENT_SESSION=${TMUX_CONTEXT_SESSION:-$(tmux display-message -p "#{session_name}")}
+WINDOW_ID=${TMUX_CONTEXT_WINDOW:-$(tmux display-message -p "#{window_id}")}
+CONTEXT_PANE=${TMUX_CONTEXT_PANE:-}
+WINDOW_NUM=${WINDOW_ID#@}
+POPUP_SESSION="_popup_window_${WINDOW_NUM}"
+resolve_popup_cwd() {
+  local cwd
+  if [ -n "${TMUX_CONTEXT_PATH:-}" ] && [ -d "${TMUX_CONTEXT_PATH:-}" ]; then
+    printf '%s\n' "$TMUX_CONTEXT_PATH"
+    return 0
+  fi
+  if [ -n "$CONTEXT_PANE" ]; then
+    cwd=$(tmux display-message -p -t "$CONTEXT_PANE" "#{pane_current_path}" 2>/dev/null || tmux display-message -p "#{pane_current_path}")
+  else
+    cwd=$(tmux display-message -p "#{pane_current_path}")
+  fi
+  printf '%s\n' "$cwd"
+}
+
+# Used only when the popup session doesn't exist yet, so the popup starts in
+# the worktree the source OMP pane is tracking (its @pi_worktree_name tmux
+# option). Later toggles reuse the popup session's own directory, unaffected
+# by this.
+worktree_cwd() {
+  local worktree_name
+  if [ -n "$CONTEXT_PANE" ]; then
+    worktree_name=$(tmux display-message -p -t "$CONTEXT_PANE" "#{@pi_worktree_name}" 2>/dev/null || true)
+  else
+    worktree_name=$(tmux display-message -p "#{@pi_worktree_name}" 2>/dev/null || true)
+  fi
+  if [[ "$worktree_name" =~ ^[A-Za-z0-9._-]+$ ]]; then
+    local candidate="$HOME/$worktree_name/src"
+    if [ -d "$candidate" ]; then
+      printf '%s\n' "$candidate"
+    fi
+  fi
+}
+
+CWD=$(resolve_popup_cwd)
+SAFE_CLIENT=$(printf '%s' "$CLIENT_TTY" | tr -c 'A-Za-z0-9._-' '_')
+POPUP_MARKER="/tmp/tmux-ghostty-popup-open-${SAFE_CLIENT}"
+
+restore_user_keys() {
+  tmux set-option -s 'user-keys[12]' "$(printf '\033[5;30013~')" 2>/dev/null || true
+  tmux set-option -s 'user-keys[21]' "$(printf '\033[5;30022~')" 2>/dev/null || true
+  tmux set-option -s 'user-keys[25]' "$(printf '\033[5;30026~')" 2>/dev/null || true
+}
+
+suspend_user_keys_for_popup() {
+  # display-popup -E passes unrecognized keys to the popup's command (the
+  # proxy). But recognized User keys are eaten by tmux before reaching the
+  # proxy. Temporarily unmap the close/toggle User keys so the proxy can
+  # intercept their raw bytes and close cleanly.
+  tmux set-option -s -u user-keys[12] 2>/dev/null || true
+  tmux set-option -s -u user-keys[21] 2>/dev/null || true
+  tmux set-option -s -u user-keys[25] 2>/dev/null || true
+}
+
+
+if [[ "$CURRENT_SESSION" == _popup_window_* ]]; then
+  exec "$HOME/.local/bin/tmux-close-popup-ghostty"
+fi
+
+if tmux has-session -t "$POPUP_SESSION" 2>/dev/null; then
+  ATTACHED=$(tmux display-message -p -t "$POPUP_SESSION" "#{session_attached}" 2>/dev/null || printf '0')
+  if [ "${ATTACHED:-0}" -gt 0 ]; then
+    exec "$HOME/.local/bin/tmux-close-popup-ghostty"
+  fi
+fi
+
+if ! tmux has-session -t "$POPUP_SESSION" 2>/dev/null; then
+  INITIAL_CWD=$(worktree_cwd)
+  if [ -z "$INITIAL_CWD" ]; then
+    INITIAL_CWD="$CWD"
+  fi
+  tmux new-session -d -s "$POPUP_SESSION" -c "$INITIAL_CWD" \
+    env QUICK_SPLIT_DIR="$INITIAL_CWD" "$HOME/.local/bin/fish-no-auto-mux"
+fi
+
+# Keep popup session behavior consistent even if prior experiments changed options.
+tmux set-option -t "$POPUP_SESSION" mouse on
+tmux set-option -t "$POPUP_SESSION" key-table popup
+tmux set-option -t "$POPUP_SESSION" status off
+tmux set-option -t "$POPUP_SESSION" prefix None
+tmux set-option -t "$POPUP_SESSION" @popup_outer_client "$CLIENT_NAME"
+tmux set-option -t "$POPUP_SESSION" @popup_outer_tty "$CLIENT_TTY"
+tmux set-option -t "$POPUP_SESSION" @popup_marker "$POPUP_MARKER"
+tmux set-option -t "$POPUP_SESSION" @popup_parent_window_id "$WINDOW_ID"
+tmux set-option -t "$POPUP_SESSION" @popup_last_seen "$(date +%s)"
+
+: > "$POPUP_MARKER"
+: > /tmp/tmux-popup-proxy-keys.log
+suspend_user_keys_for_popup
+trap 'restore_user_keys; rm -f "$POPUP_MARKER"' EXIT
+
+tmux display-popup -E -c "$CLIENT_NAME" -d "$CWD" -w 80% -h 80% -x C -y C \
+  "env POPUP_SESSION='$POPUP_SESSION' POPUP_MARKER='$POPUP_MARKER' '$HOME/.local/bin/tmux-popup-attach-proxy-ghostty'"

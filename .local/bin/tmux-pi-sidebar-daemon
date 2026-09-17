@@ -1,0 +1,400 @@
+#!/usr/bin/env python3
+import concurrent.futures
+import fcntl
+import os
+import queue
+import runpy
+import selectors
+import signal
+import socket
+import struct
+import subprocess
+import sys
+import threading
+import time
+
+SOCKET_PATH = os.environ.get("PI_SIDEBAR_DAEMON_SOCKET", "/tmp/tmux-pi-sidebar-daemon.sock")
+PID_PATH = os.environ.get("PI_SIDEBAR_DAEMON_PID", "/tmp/tmux-pi-sidebar-daemon.pid")
+LOCK_PATH = os.environ.get("PI_SIDEBAR_DAEMON_LOCK", "/tmp/tmux-pi-sidebar-daemon.lock")
+SIDEBAR_PATH = os.path.expanduser("~/.local/bin/tmux-pi-sidebar")
+TOGGLE_PATH = os.path.expanduser("~/.local/bin/tmux-pi-sidebar-toggle")
+SYNC_BEGIN = b"\x1b[?2026h"
+SYNC_END = b"\x1b[?2026l"
+
+running = True
+refresh_requested = True
+selection_requested = False
+input_queue = queue.Queue()
+clients = {}
+clients_lock = threading.Lock()
+
+
+def tmux_command(*args):
+    tmux_socket = os.environ.get("PI_SIDEBAR_TMUX_SOCKET", "")
+    return ["tmux"] + (["-L", tmux_socket] if tmux_socket else []) + list(args)
+
+
+def on_stop(_signum, _frame):
+    global running
+    running = False
+
+
+def on_refresh(_signum, _frame):
+    global refresh_requested, selection_requested
+    refresh_requested = True
+    selection_requested = True
+
+
+def send_line(conn, text):
+    data = text.encode("utf-8")
+    conn.sendall(data)
+
+
+def client_reader(conn):
+    buffer = b""
+    try:
+        while running:
+            data = conn.recv(4096)
+            if not data:
+                break
+            buffer += data
+            while b"\n" in buffer:
+                line, buffer = buffer.split(b"\n", 1)
+                parts = line.decode("ascii", errors="ignore").split()
+                if not parts:
+                    continue
+                with clients_lock:
+                    client = clients.get(conn)
+                    if client is None:
+                        continue
+                    if parts[0] == "P" and len(parts) == 2:
+                        client["pane"] = parts[1]
+                        client["dirty"] = True
+                    elif parts[0] == "S" and len(parts) == 3:
+                        try:
+                            client["width"] = max(2, int(parts[1]))
+                            client["height"] = max(3, int(parts[2]))
+                            client["dirty"] = True
+                        except ValueError:
+                            pass
+                    elif parts[0] == "I" and len(parts) == 2:
+                        try:
+                            payload = bytes.fromhex(parts[1])
+                        except ValueError:
+                            payload = b""
+                        if payload:
+                            input_queue.put((conn, payload))
+    except OSError:
+        pass
+    finally:
+        with clients_lock:
+            clients.pop(conn, None)
+        try:
+            conn.close()
+        except OSError:
+            pass
+
+
+def accept_clients(server):
+    server.settimeout(0.5)
+    while running:
+        try:
+            conn, _ = server.accept()
+        except socket.timeout:
+            continue
+        except OSError:
+            break
+        conn.setblocking(True)
+        with clients_lock:
+            clients[conn] = {
+                "pane": "",
+                "width": 53,
+                "height": 24,
+                "dirty": True,
+                "refresh": False,
+                "rendered": None,
+                "lock": threading.Lock(),
+            }
+        threading.Thread(target=client_reader, args=(conn,), daemon=True).start()
+
+
+def write_frame(conn, client, frame):
+    packet = struct.pack("!I", len(frame)) + frame
+    try:
+        with client["lock"]:
+            conn.sendall(packet)
+        return True
+    except OSError:
+        with clients_lock:
+            clients.pop(conn, None)
+        try:
+            conn.close()
+        except OSError:
+            pass
+        return False
+
+
+def active_view_panes():
+    active = set()
+    try:
+        result = subprocess.run(
+            tmux_command(
+                "list-panes", "-a", "-F",
+                "#{pane_id}\t#{window_active}\t#{session_attached}\t#{@pi_sidebar_kind}",
+            ),
+            capture_output=True,
+            text=True,
+            timeout=0.8,
+            check=False,
+        )
+        for line in result.stdout.splitlines():
+            pane, window_active, attached, kind = (line.split("\t") + ["", "", "", ""])[:4]
+            if kind == "pi-sidebar" and window_active == "1" and attached not in {"", "0"}:
+                active.add(pane)
+    except Exception:
+        pass
+    return active
+
+
+def main():
+    global running, refresh_requested, selection_requested
+    signal.signal(signal.SIGTERM, on_stop)
+    signal.signal(signal.SIGINT, on_stop)
+    signal.signal(signal.SIGUSR1, on_refresh)
+
+    lock_fh = open(LOCK_PATH, "w", encoding="utf-8")
+    try:
+        fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return 0
+
+    os.environ.setdefault("PI_SIDEBAR_TMUX_SOCKET", "ghostty-main")
+    namespace = runpy.run_path(SIDEBAR_PATH, run_name="tmux_pi_sidebar_library")
+    render_expanded = namespace["render_expanded"]
+    render_collapsed = namespace["render_collapsed"]
+    fetch_pane_state = namespace["fetch_pane_state"]
+    handle_input = namespace["handle_input"]
+    track_closed_panes = namespace.get("track_closed_panes")
+    globals_map = render_expanded.__globals__
+
+    def shared_sidebar_action():
+        action = "expand" if globals_map["MODE"] == "collapsed" else "collapse"
+        try:
+            subprocess.Popen(
+                [TOGGLE_PATH, action],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except OSError:
+            pass
+
+    globals_map["sidebar_action"] = shared_sidebar_action
+    globals_map["EXTERNAL_SIDEBAR"] = True
+    globals_map["TARGET_CLIENT"] = ""
+
+    try:
+        os.unlink(SOCKET_PATH)
+    except FileNotFoundError:
+        pass
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(SOCKET_PATH)
+    os.chmod(SOCKET_PATH, 0o600)
+    server.listen(32)
+    with open(PID_PATH, "w", encoding="utf-8") as pid_file:
+        pid_file.write(str(os.getpid()))
+    subprocess.run(
+        tmux_command("set-option", "-gq", "@pi_sidebar_external_pid", str(os.getpid())),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    threading.Thread(target=accept_clients, args=(server,), daemon=True).start()
+
+    state = fetch_pane_state()
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    future = None
+    next_fetch = time.monotonic() + 1.0
+    next_frame = time.monotonic() + 0.1
+    active_panes = active_view_panes()
+    globals_map["_pane_state"] = state
+    selection_broadcast = False
+
+    def apply_selection_hint():
+        nonlocal state
+        if not state:
+            return False
+        pane_id = globals_map["load_selected_hint"]()
+        panes, color_map, grouped, selected_pane_id, unread = state
+        if pane_id == selected_pane_id:
+            return False
+        if pane_id not in {pane.pane_id for pane in panes}:
+            return False
+        state = panes, color_map, grouped, pane_id, unread
+        globals_map["_pane_state"] = state
+        return True
+    def frame_for(client, cache=None):
+        width = client["width"]
+        height = client["height"]
+        key = (width, height)
+        if cache is not None and key in cache:
+            return cache[key]
+        globals_map["MODE"] = "collapsed" if width <= 15 else "expanded"
+        if globals_map["MODE"] == "collapsed":
+            text = render_collapsed(width, height, state)
+        else:
+            text = render_expanded(width, height, state)
+        rendered = {
+            "frame": SYNC_BEGIN + text.encode("utf-8") + SYNC_END,
+            "mode": globals_map["MODE"],
+            "click_targets": dict(globals_map["CLICK_TARGETS"]),
+            "session_targets": dict(globals_map["SESSION_BUTTON_TARGETS"]),
+            "collapse_row": globals_map["_collapse_button_row"],
+        }
+        if cache is not None:
+            cache[key] = rendered
+        return rendered
+
+    def activate_client_targets(client):
+        rendered = client.get("rendered")
+        if rendered is None:
+            rendered = frame_for(client)
+        globals_map["MODE"] = rendered["mode"]
+        globals_map["CLICK_TARGETS"] = rendered["click_targets"]
+        globals_map["SESSION_BUTTON_TARGETS"] = rendered["session_targets"]
+        globals_map["_collapse_button_row"] = rendered["collapse_row"]
+
+    try:
+        while running:
+            now = time.monotonic()
+            if selection_requested:
+                selection_requested = False
+                if apply_selection_hint():
+                    selection_broadcast = True
+            if refresh_requested:
+                refresh_requested = False
+                if future is None:
+                    future = executor.submit(fetch_pane_state)
+            if now >= next_fetch:
+                if future is None:
+                    future = executor.submit(fetch_pane_state)
+                next_fetch = now + 1.0
+            if future is not None and future.done():
+                try:
+                    state = future.result()
+                    globals_map["_pane_state"] = state
+                    apply_selection_hint()
+                except Exception:
+                    pass
+                if track_closed_panes:
+                    try:
+                        track_closed_panes()
+                    except Exception:
+                        pass
+                future = None
+                active_panes = active_view_panes()
+                with clients_lock:
+                    for client in clients.values():
+                        client["refresh"] = client["pane"] not in active_panes
+
+            while True:
+                try:
+                    conn, payload = input_queue.get_nowait()
+                except queue.Empty:
+                    break
+                with clients_lock:
+                    client = clients.get(conn)
+                    if client is None:
+                        continue
+                    width = client["width"]
+                try:
+                    activate_client_targets(client)
+                    handle_input(payload, width)
+                    if apply_selection_hint():
+                        selection_broadcast = True
+                except Exception:
+                    pass
+
+            now = time.monotonic()
+            animate = now >= next_frame
+            if animate:
+                steps = 1 + int((now - next_frame) / 0.1)
+                globals_map["advance_animation"](steps)
+                next_frame += steps * 0.1
+                try:
+                    if state:
+                        globals_map["update_tab_title_signals"](state[0])
+                except Exception:
+                    pass
+
+            with clients_lock:
+                snapshot = list(clients.items())
+            frame_cache = {}
+
+            # Active and newly connected views have priority. A state refresh
+            # never inserts an extra frame into the active 10fps cadence.
+            priority = [
+                (conn, client) for conn, client in snapshot
+                if selection_broadcast or client["dirty"]
+                or (animate and client["pane"] in active_panes)
+            ]
+            sent = set()
+            for conn, client in priority:
+                try:
+                    rendered = frame_for(client, frame_cache)
+                except Exception:
+                    continue
+                if write_frame(conn, client, rendered["frame"]):
+                    client["rendered"] = rendered
+                    client["dirty"] = False
+                    client["refresh"] = False
+                    sent.add(conn)
+            selection_broadcast = False
+
+            # Stagger hidden snapshots so they cannot block the visible frame.
+            hidden_sent = 0
+            for conn, client in snapshot:
+                if conn in sent or not client["refresh"]:
+                    continue
+                try:
+                    rendered = frame_for(client, frame_cache)
+                except Exception:
+                    continue
+                if write_frame(conn, client, rendered["frame"]):
+                    client["rendered"] = rendered
+                    client["refresh"] = False
+                    hidden_sent += 1
+                if hidden_sent >= 4:
+                    break
+            time.sleep(0.01)
+    finally:
+        running = False
+        executor.shutdown(wait=False, cancel_futures=True)
+        try:
+            server.close()
+        except OSError:
+            pass
+        with clients_lock:
+            snapshot = list(clients)
+            clients.clear()
+        for conn in snapshot:
+            try:
+                conn.close()
+            except OSError:
+                pass
+        subprocess.run(
+            tmux_command("set-option", "-gu", "@pi_sidebar_external_pid"),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        for path in (SOCKET_PATH, PID_PATH):
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

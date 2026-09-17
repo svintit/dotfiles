@@ -1,0 +1,101 @@
+#!/bin/sh
+
+AEROSPACE=/opt/homebrew/bin/aerospace
+HS=/Applications/Hammerspoon.app/Contents/Frameworks/hs/hs
+STATE_DIR="$HOME/.local/state/aerospace"
+TARGET_FILE="$STATE_DIR/spotify-target-workspace"
+LOCK_DIR="$STATE_DIR/spotify-pin.lock"
+
+mkdir -p "$STATE_DIR"
+requested_id="$1"
+
+# Select the target monitor for pinning Spotify.  Set AEROSPACE_SPOTIFY_MONITOR
+# to a case-insensitive substring of the monitor name (e.g. "lg" or "samsung") to
+# override the default heuristic, which prefers the first non-built-in monitor.
+target_id="$($AEROSPACE list-monitors --format '%{monitor-name}|%{monitor-id}' | awk -F'|' -v pat="${AEROSPACE_SPOTIFY_MONITOR:-}" '
+    BEGIN { pat = tolower(pat) }
+    tolower($1) ~ pat && pat != "" { print $2; found=1; exit }
+    tolower($1) ~ /built-in/ { built_in=$2; next }
+    !found && !external_done { external=$2; external_done=1 }
+    END {
+        if (found) { }
+        else if (external) print external
+        else if (built_in) print built_in
+    }
+')"
+[ -n "$target_id" ] || exit 0
+
+workspace=
+if [ -n "$AEROSPACE_FOCUSED_WORKSPACE" ]; then
+    event_workspace="$($AEROSPACE list-workspaces --monitor "$target_id" --format '%{workspace}' |
+        awk -v target="$AEROSPACE_FOCUSED_WORKSPACE" '$0 == target { print; exit }')"
+    if [ -n "$event_workspace" ]; then
+        sleep 0.05
+        visible_workspace="$($AEROSPACE list-workspaces --monitor "$target_id" --visible --format '%{workspace}' |
+            awk 'NR == 1 { print; exit }')"
+        [ "$visible_workspace" = "$event_workspace" ] || exit 0
+        workspace="$event_workspace"
+    fi
+fi
+if [ -z "$workspace" ]; then
+    workspace="$($AEROSPACE list-workspaces --monitor "$target_id" --visible --format '%{workspace}' |
+        awk 'NR == 1 { print; exit }')"
+fi
+[ -n "$workspace" ] || exit 0
+
+printf '%s\n' "$workspace" > "$TARGET_FILE.$$" && mv "$TARGET_FILE.$$" "$TARGET_FILE"
+mkdir "$LOCK_DIR" 2>/dev/null || exit 0
+trap 'rmdir "$LOCK_DIR" 2>/dev/null' EXIT INT TERM
+
+while :; do
+    workspace="$(cat "$TARGET_FILE" 2>/dev/null)"
+    [ -n "$workspace" ] || exit 0
+
+    focused="$($AEROSPACE list-windows --focused --format '%{window-id}|%{workspace}' 2>/dev/null)"
+    focused_id="${focused%%|*}"
+    focused_workspace="${focused#*|}"
+    [ "$focused_workspace" = "$focused" ] && focused_workspace=
+
+    case "$requested_id" in
+        ''|*[!0-9]*)
+            mini_ids="$("$HS" -q -t 2 -c '
+                local ids = _G.spotifyMiniPlayerWindowIds
+                    and _G.spotifyMiniPlayerWindowIds() or {}
+                for index, id in ipairs(ids) do ids[index] = tostring(id) end
+                return table.concat(ids, " ")
+            ' 2>/dev/null)"
+            ;;
+        *) mini_ids="$requested_id" ;;
+    esac
+    window_rows="$($AEROSPACE list-windows --all --format '%{window-id}|%{workspace}')"
+
+    moved_id=
+    for window_id in $mini_ids; do
+        current_workspace="$(printf '%s\n' "$window_rows" |
+            awk -F'|' -v id="$window_id" '$1 == id { print $2; exit }')"
+        [ -n "$current_workspace" ] || continue
+        [ "$current_workspace" = "$workspace" ] && continue
+        "$AEROSPACE" layout floating --window-id "$window_id" >/dev/null 2>&1
+        if "$AEROSPACE" move-node-to-workspace "$workspace" --window-id "$window_id" >/dev/null 2>&1; then
+            [ -n "$moved_id" ] || moved_id="$window_id"
+        fi
+    done
+
+    if [ -n "$moved_id" ]; then
+        if [ -n "$focused_id" ] && [ "$focused_workspace" = "$workspace" ]; then
+            "$AEROSPACE" focus --window-id "$focused_id" >/dev/null 2>&1
+        else
+            "$AEROSPACE" focus --window-id "$moved_id" >/dev/null 2>&1
+        fi
+    fi
+
+    latest="$(cat "$TARGET_FILE" 2>/dev/null)"
+    [ "$latest" != "$workspace" ] && continue
+
+    rmdir "$LOCK_DIR" 2>/dev/null
+    trap - EXIT INT TERM
+    [ "$(cat "$TARGET_FILE" 2>/dev/null)" = "$workspace" ] && exit 0
+
+    mkdir "$LOCK_DIR" 2>/dev/null || exit 0
+    trap 'rmdir "$LOCK_DIR" 2>/dev/null' EXIT INT TERM
+done

@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SOCK=${1:-ghostty-main}
+NOW=$(date +%s)
+LEGACY_TTL_SECONDS=${LEGACY_TTL_SECONDS:-86400}
+DRY_RUN=${DRY_RUN:-0}
+
+window_ids=$(tmux -L "$SOCK" list-windows -a -F '#{window_id}' 2>/dev/null || true)
+
+kill_popup_session() {
+  local session=$1
+  local reason=$2
+  if [ "$DRY_RUN" = "1" ]; then
+    printf 'would kill %s: %s\n' "$session" "$reason"
+    return 0
+  fi
+  tmux -L "$SOCK" kill-session -t "$session" 2>/dev/null || true
+}
+
+is_integer() {
+  case ${1:-} in
+    ''|*[!0-9]*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+tmux -L "$SOCK" list-sessions -F '#{session_name}' 2>/dev/null |
+while IFS= read -r session; do
+  [ -n "$session" ] || continue
+  [[ "$session" == _popup_window_* ]] || continue
+
+  attached=$(tmux -L "$SOCK" display-message -p -t "$session:" '#{session_attached}' 2>/dev/null || printf '0')
+  if is_integer "$attached" && [ "$attached" -gt 0 ]; then
+    continue
+  fi
+
+  owner=$(tmux -L "$SOCK" show-option -qv -t "$session" @popup_parent_window_id 2>/dev/null || true)
+  if [ -n "$owner" ]; then
+    if ! grep -Fxq "$owner" <<< "$window_ids"; then
+      kill_popup_session "$session" "parent window $owner no longer exists"
+    fi
+    continue
+  fi
+
+  last_seen=$(tmux -L "$SOCK" show-option -qv -t "$session" @popup_last_seen 2>/dev/null || true)
+  if ! is_integer "$last_seen"; then
+    last_seen=$(tmux -L "$SOCK" display-message -p -t "$session:" '#{session_created}' 2>/dev/null || true)
+  fi
+  if ! is_integer "$last_seen"; then
+    last_seen=$NOW
+  fi
+
+  age=$((NOW - last_seen))
+  if [ "$age" -gt "$LEGACY_TTL_SECONDS" ]; then
+    kill_popup_session "$session" "legacy popup without owner metadata is ${age}s old"
+  fi
+done

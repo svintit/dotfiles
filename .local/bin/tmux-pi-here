@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+pane_id="${1:-${TMUX_PANE:-}}"
+if [[ -z "$pane_id" ]]; then
+  pane_id="$(tmux display-message -p '#{pane_id}')"
+fi
+if [[ -z "$pane_id" ]]; then
+  tmux display-message "no pane id"
+  exit 0
+fi
+
+pane_tty=""
+pane_cmd=""
+fg_pgid=""
+fg_comm=""
+
+for _ in 1 2 3 4 5 6 7 8; do
+  pane_tty="$(tmux display-message -p -t "$pane_id" '#{pane_tty}' 2>/dev/null || true)"
+  pane_cmd="$(tmux display-message -p -t "$pane_id" '#{pane_current_command}' 2>/dev/null || true)"
+  short_tty="${pane_tty#/dev/}"
+
+  if [[ -n "$short_tty" ]]; then
+    fg_pgid="$(ps -Ao pid=,tty=,tpgid= | awk -v tty="$short_tty" '$2==tty && !found {print $3; found=1}')"
+    if [[ -n "$fg_pgid" ]]; then
+      fg_comm="$(ps -Ao pid=,tty=,comm= | awk -v tty="$short_tty" -v pgid="$fg_pgid" '$1==pgid && $2==tty && !found {print $3; found=1}')"
+      fg_comm="${fg_comm#-}"
+    else
+      fg_comm=""
+    fi
+  fi
+
+  case "$pane_cmd:$fg_comm" in
+    fish:fish|zsh:zsh|bash:bash|sh:sh|nu:nu)
+      tmux send-keys -t "$pane_id" "pi" C-m
+      exit 0
+      ;;
+  esac
+
+  sleep 0.03
+done
+
+if [[ "$pane_cmd" =~ ^(fish|zsh|bash|sh|nu)$ && -z "$fg_comm" ]]; then
+  tmux send-keys -t "$pane_id" "pi" C-m
+else
+  tmux display-message "not in shell pane (pane=${pane_cmd:-none} fg=${fg_comm:-none})"
+fi

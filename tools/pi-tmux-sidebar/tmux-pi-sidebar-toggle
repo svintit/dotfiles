@@ -1,0 +1,423 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SIDEBAR_TITLE="__gap__"
+SIDEBAR_KIND="pi-sidebar"
+SELECTION_HINT_FILE="/tmp/pi-sidebar-selected-pane"
+# Resolve the sidebar TUI script relative to this script's own location
+# (handles symlinks portably, no readlink -f needed).
+__src="${BASH_SOURCE[0]}"
+while [ -L "$__src" ]; do
+  __dir="$(cd -P "$(dirname "$__src")" >/dev/null 2>&1 && pwd)"
+  __src="$(readlink "$__src")"
+  [[ "$__src" != /* ]] && __src="$__dir/$__src"
+done
+__script_dir="$(cd -P "$(dirname "$__src")" >/dev/null 2>&1 && pwd)"
+# Use the compiled binary when available; fall back to the Python script.
+if [ -x "$__script_dir/pi-sidebar-view" ]; then
+  SIDEBAR_CMD="$__script_dir/pi-sidebar-view"
+else
+  SIDEBAR_CMD="$__script_dir/tmux-pi-sidebar"
+fi
+SIDEBAR_DAEMON="$__script_dir/tmux-pi-sidebar-daemon"
+SIDEBAR_MAIN="$__script_dir/tmux-pi-sidebar"
+DAEMON_SOCKET="${PI_SIDEBAR_DAEMON_SOCKET:-/tmp/tmux-pi-sidebar-daemon.sock}"
+DAEMON_PID_FILE="${PI_SIDEBAR_DAEMON_PID:-/tmp/tmux-pi-sidebar-daemon.pid}"
+DAEMON_LOCK="${PI_SIDEBAR_DAEMON_LOCK:-/tmp/tmux-pi-sidebar-daemon.lock}"
+DAEMON_LOG="${PI_SIDEBAR_DAEMON_LOG:-/tmp/tmux-pi-sidebar-daemon.log}"
+DAEMON_SESSION="_pi_sidebar_daemon"
+DAEMON_START_LOCK="${DAEMON_PID_FILE}.start.lock"
+TMUX_BIN="${TMUX_BIN:-tmux}"
+
+tmux() {
+  command "$TMUX_BIN" "$@"
+}
+WIDTH_DEFAULT=53
+# 3 left margin + 4 content ("NN I") + 3 right margin, matching the expanded insets.
+COLLAPSED_WIDTH_DEFAULT=10
+
+usage() {
+  cat <<'USAGE'
+Usage: tmux-pi-sidebar-toggle [toggle|show|expand|collapse|hide|ensure|kill-all|restore-last|runtime-disable|real-target|focus-real]
+
+  toggle          Toggle expanded/collapsed globally.
+  show, expand    Enable globally and show the full sidebar in the current window.
+  collapse        Enable globally and shrink the sidebar to a left handle.
+  hide            Disable globally and remove all sidebar panes and handles.
+  ensure          If globally enabled, ensure the current window has the right sidebar mode.
+  kill-all        Remove sidebar panes without changing flags.
+  restore-last   Reopen the most recently closed pane (resume if it was an OMP/Pi session).
+  runtime-disable Hide panes and remove active hooks/bindings from this tmux server.
+  real-target <window>  Print the non-sidebar pane id for a window.
+  focus-real <window>   Select the non-sidebar pane for a window.
+USAGE
+}
+
+tmuxq() {
+  tmux "$@" 2>/dev/null || true
+}
+
+option() {
+  tmux show -gqv "$1" 2>/dev/null || true
+}
+
+width() {
+  local configured
+  configured=$(option @pi_sidebar_width)
+  if [[ "$configured" =~ ^[0-9]+$ ]] && [ "$configured" -ge 18 ]; then
+    printf '%s\n' "$configured"
+  else
+    printf '%s\n' "$WIDTH_DEFAULT"
+  fi
+}
+
+collapsed_width() {
+  local configured
+  configured=$(option @pi_sidebar_collapsed_width)
+  if [[ "$configured" =~ ^[0-9]+$ ]] && [ "$configured" -ge 2 ]; then
+    printf '%s\n' "$configured"
+  else
+    printf '%s\n' "$COLLAPSED_WIDTH_DEFAULT"
+  fi
+}
+daemon_running() {
+  local pid
+  pid=$(cat "$DAEMON_PID_FILE" 2>/dev/null || true)
+  [[ "$pid" =~ ^[0-9]+$ ]] \
+    && kill -0 "$pid" 2>/dev/null \
+    && [ -S "$DAEMON_SOCKET" ] \
+    && tmux has-session -t "=$DAEMON_SESSION" 2>/dev/null
+}
+
+ensure_daemon() (
+  local attempt client_sessions client_name session_name pid daemon_command daemon_launch
+  daemon_running && exit 0
+  if ! mkdir "$DAEMON_START_LOCK" 2>/dev/null; then
+    for attempt in $(seq 1 100); do
+      daemon_running && exit 0
+      sleep 0.02
+    done
+    exit 1
+  fi
+  trap 'rmdir "$DAEMON_START_LOCK" 2>/dev/null || true' EXIT
+  daemon_running && exit 0
+
+  client_sessions=$(tmux list-clients -F '#{client_name}|#{session_name}' 2>/dev/null || true)
+  pid=$(cat "$DAEMON_PID_FILE" 2>/dev/null || true)
+  tmuxq kill-session -t "=$DAEMON_SESSION"
+  if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+    daemon_command=$(ps -p "$pid" -o command= 2>/dev/null || true)
+    if [[ "$daemon_command" == *"$SIDEBAR_DAEMON"* ]]; then
+      kill "$pid" 2>/dev/null || true
+      for attempt in $(seq 1 20); do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.02
+      done
+    fi
+  fi
+  rm -f "$DAEMON_PID_FILE" "$DAEMON_SOCKET"
+  printf -v daemon_launch 'exec %q' "$SIDEBAR_DAEMON"
+  tmux new-session -d -s "$DAEMON_SESSION" -n daemon \
+    -e "PI_SIDEBAR_TMUX_SOCKET=${PI_SIDEBAR_TMUX_SOCKET:-}" \
+    -e "PI_SIDEBAR_DAEMON_SOCKET=$DAEMON_SOCKET" \
+    -e "PI_SIDEBAR_DAEMON_PID=$DAEMON_PID_FILE" \
+    -e "PI_SIDEBAR_DAEMON_LOCK=$DAEMON_LOCK" \
+    "$daemon_launch"
+  while IFS='|' read -r client_name session_name; do
+    [ -n "$client_name" ] && [ -n "$session_name" ] || continue
+    tmuxq switch-client -c "$client_name" -t "$session_name"
+  done <<<"$client_sessions"
+  for attempt in $(seq 1 50); do
+    daemon_running && exit 0
+    sleep 0.02
+  done
+  exit 1
+)
+
+stop_daemon() {
+  local pid
+  pid=$(cat "$DAEMON_PID_FILE" 2>/dev/null || true)
+  tmuxq kill-session -t "=$DAEMON_SESSION"
+  if [[ "$pid" =~ ^[0-9]+$ ]]; then
+    kill "$pid" 2>/dev/null || true
+  fi
+  rm -f "$DAEMON_PID_FILE" "$DAEMON_SOCKET"
+}
+
+sidebar_state() {
+  local state
+  state=$(option @pi_sidebar_state)
+  case "$state" in
+    collapsed) printf 'collapsed\n' ;;
+    *) printf 'expanded\n' ;;
+  esac
+}
+
+current_session() {
+  if [ -n "${TMUX_TARGET_SESSION:-}" ]; then
+    printf '%s\n' "$TMUX_TARGET_SESSION"
+  else
+    tmux display-message -p '#{session_name}' 2>/dev/null || true
+  fi
+}
+
+current_window() {
+  if [ -n "${TMUX_TARGET_WINDOW:-}" ]; then
+    printf '%s\n' "$TMUX_TARGET_WINDOW"
+  else
+    tmux display-message -p '#{window_id}' 2>/dev/null || true
+  fi
+}
+
+current_client() {
+  if [ -n "${TMUX_TARGET_CLIENT:-}" ]; then
+    printf '%s\n' "$TMUX_TARGET_CLIENT"
+  else
+    tmux display-message -p '#{client_name}' 2>/dev/null || true
+  fi
+}
+
+current_pane() {
+  tmux display-message -p '#{pane_id}' 2>/dev/null || true
+}
+
+is_internal_session() {
+  local session=${1:-}
+  [[ "$session" == _* ]]
+}
+
+sidebar_panes_all() {
+  tmux list-panes -a -F '#{pane_id} #{@pi_sidebar_kind}' 2>/dev/null \
+    | awk -v kind="$SIDEBAR_KIND" '$2 == kind { print $1 }'
+}
+
+sidebar_pane_for_window() {
+  local window=${1:?window required}
+  tmux list-panes -t "$window" -F '#{pane_id} #{@pi_sidebar_kind}' 2>/dev/null \
+    | awk -v kind="$SIDEBAR_KIND" '$2 == kind { print $1; exit }'
+}
+
+sidebar_mode_for_pane() {
+  local pane=${1:?pane required}
+  tmux display-message -p -t "$pane" '#{@pi_sidebar_mode}' 2>/dev/null || true
+}
+
+
+publish_selection_hint() {
+  local pane=${1:-} tmp
+  [ -n "$pane" ] || return 0
+  tmp="${SELECTION_HINT_FILE}.$$"
+  printf '%s\n' "$pane" >"$tmp"
+  mv "$tmp" "$SELECTION_HINT_FILE"
+}
+
+selection_changed() {
+  local pane=${TMUX_TARGET_PANE:-} pid=${TMUX_SIDEBAR_PID:-} kind session
+  [ -n "$pane" ] || return 0
+  kind=$(tmux show-option -pqv -t "$pane" @pi_sidebar_kind 2>/dev/null || true)
+  [ "$kind" = "$SIDEBAR_KIND" ] && return 0
+  session=$(tmux display-message -p -t "$pane" '#{session_name}' 2>/dev/null || true)
+  is_internal_session "$session" && return 0
+  publish_selection_hint "$pane"
+  if [[ "$pid" =~ ^[0-9]+$ ]]; then
+    kill -USR1 "$pid" 2>/dev/null || true
+  fi
+}
+
+real_target_pane_for_window() {
+  local window=${1:?window required}
+  local active current current_window_id
+  current=$(current_pane)
+  if [ -n "$current" ]; then
+    current_window_id=$(tmux display-message -p -t "$current" '#{window_id}' 2>/dev/null || true)
+    active=$(tmux display-message -p -t "$current" '#{@pi_sidebar_kind}' 2>/dev/null || true)
+    if [ "$current_window_id" = "$window" ] && [ "$active" != "$SIDEBAR_KIND" ]; then
+      printf '%s\n' "$current"
+      return 0
+    fi
+  fi
+  tmux list-panes -t "$window" -F '#{pane_id} #{@pi_sidebar_kind}' 2>/dev/null \
+    | awk -v kind="$SIDEBAR_KIND" '$2 != kind { print $1; exit }'
+}
+
+focus_real() {
+  local window=${1:?window required} target
+  target=$(real_target_pane_for_window "$window")
+  [ -n "$target" ] || return 0
+  tmux select-pane -t "$target"
+}
+
+kill_sidebar_for_window() {
+  local window=${1:?window required}
+  local pane
+  tmux list-panes -t "$window" -F '#{pane_id} #{@pi_sidebar_kind}' 2>/dev/null \
+    | awk -v kind="$SIDEBAR_KIND" '$2 == kind { print $1 }' \
+    | while IFS= read -r pane; do
+        [ -n "$pane" ] && tmuxq kill-pane -t "$pane"
+      done
+}
+
+kill_all() {
+  local pane
+  sidebar_panes_all | while IFS= read -r pane; do
+    [ -n "$pane" ] && tmuxq kill-pane -t "$pane"
+  done
+}
+
+hide() {
+  tmux set-option -gq @pi_sidebar_enabled 0
+  kill_all
+  stop_daemon
+}
+
+show() {
+  tmux set-option -gq @pi_sidebar_enabled 1
+  tmux set-option -gq @pi_sidebar_state expanded
+  ensure_all
+}
+
+collapse() {
+  tmux set-option -gq @pi_sidebar_enabled 1
+  tmux set-option -gq @pi_sidebar_state collapsed
+  ensure_all
+}
+
+ensure_for_window() {
+  local window=${1:?window required} state=${2:?state required} client=${3:-}
+  local session existing existing_mode target pane size cmd lock_key lock_dir
+  session=${window%%:*}
+  is_internal_session "$session" && return 0
+  ensure_daemon || return 0
+
+  lock_key=$(printf '%s' "$window" | tr -cd 'A-Za-z0-9_')
+  lock_dir="/tmp/tmux-pi-sidebar-ensure-${lock_key}.lock"
+  if ! mkdir "$lock_dir" 2>/dev/null; then
+    return 0
+  fi
+  trap "rmdir '$lock_dir' 2>/dev/null || true" RETURN
+
+  existing=$(sidebar_pane_for_window "$window")
+  if [ -n "$existing" ]; then
+    existing_mode=$(sidebar_mode_for_pane "$existing")
+    if [ "$existing_mode" = "$state" ]; then
+      return 0
+    fi
+    kill_sidebar_for_window "$window"
+  fi
+
+  target=$(real_target_pane_for_window "$window")
+  [ -n "$target" ] || return 0
+
+  if [ "$state" = "collapsed" ]; then
+    size=$(collapsed_width)
+  else
+    size=$(width)
+  fi
+  printf -v cmd 'exec %q' "$SIDEBAR_CMD"
+
+  pane=$(tmux split-window -d -f -h -b -l "$size" -t "$target" -c "$HOME" \
+    -e "PI_SIDEBAR_DAEMON_SOCKET=$DAEMON_SOCKET" -P -F '#{pane_id}' "$cmd")
+  [ -n "$pane" ] || return 0
+  tmux set-option -pq -t "$pane" @pi_sidebar_kind "$SIDEBAR_KIND"
+  tmux set-option -pq -t "$pane" @pi_sidebar_mode "$state"
+  tmux select-pane -t "$pane" -T "$SIDEBAR_TITLE" >/dev/null 2>&1 || true
+  tmux set-option -wq -t "$window" @pi_sidebar_pane "$pane"
+  tmux select-pane -t "$target" >/dev/null 2>&1 || true
+}
+
+ensure_all() {
+  local enabled state client window
+  enabled=$(option @pi_sidebar_enabled)
+  [ "$enabled" = "1" ] || return 0
+  state=$(sidebar_state)
+  client=$(current_client)
+  tmux list-windows -a -F '#{session_name}:#{window_index}' 2>/dev/null \
+    | while IFS= read -r window; do
+        [ -n "$window" ] || continue
+        ensure_for_window "$window" "$state" "$client"
+      done
+}
+
+ensure() {
+  local enabled session window state client
+  enabled=$(option @pi_sidebar_enabled)
+  [ "$enabled" = "1" ] || exit 0
+
+  session=$(current_session)
+  [ -n "$session" ] || exit 0
+  if is_internal_session "$session"; then
+    exit 0
+  fi
+
+  window=$(current_window)
+  [ -n "$window" ] || exit 0
+
+  state=$(sidebar_state)
+  client=$(current_client)
+  ensure_for_window "$window" "$state" "$client"
+}
+
+toggle() {
+  local enabled state
+  enabled=$(option @pi_sidebar_enabled)
+  if [ "$enabled" != "1" ]; then
+    show
+    return
+  fi
+  state=$(sidebar_state)
+  if [ "$state" = "collapsed" ]; then
+    show
+  else
+    collapse
+  fi
+}
+
+runtime_disable() {
+  hide
+  tmuxq set-hook -gu client-session-changed[80]
+  tmuxq set-hook -gu after-select-window[80]
+  tmuxq set-hook -gu after-new-window[80]
+  tmuxq unbind-key B
+  tmuxq set-option -gu @pi_sidebar_width
+  tmuxq set-option -gu @pi_sidebar_collapsed_width
+  tmuxq set-option -gu @pi_sidebar_state
+  tmuxq set-option -gu @pi_sidebar_enabled
+  tmuxq set-hook -gu window-resized[80]
+}
+
+resize() {
+  local window sidebar_pane size state
+  window="${TMUX_TARGET_WINDOW:-$(current_window)}"
+  [ -n "$window" ] || return 0
+  sidebar_pane=$(sidebar_pane_for_window "$window")
+  [ -n "$sidebar_pane" ] || return 0
+  state=$(sidebar_state)
+  if [ "$state" = "collapsed" ]; then
+    size=$(collapsed_width)
+  else
+    size=$(width)
+  fi
+  tmuxq resize-pane -t "$sidebar_pane" -x "$size"
+}
+
+cmd=${1:-toggle}
+case "$cmd" in
+  toggle) toggle ;;
+  show|expand) show ;;
+  collapse) collapse ;;
+  hide) hide ;;
+  resize) resize ;;
+  ensure) ensure ;;
+  selection-changed) selection_changed ;;
+  ensure-all) ensure_all ;;
+  real-target) real_target_pane_for_window "${2:?window required}" ;;
+  focus-real) focus_real "${2:?window required}" ;;
+  restore-last) "$SIDEBAR_MAIN" --restore-last ;;
+  kill-all) kill_all ;;
+  runtime-disable) runtime_disable ;;
+  -h|--help|help) usage ;;
+  *)
+    usage >&2
+    exit 2
+    ;;
+esac

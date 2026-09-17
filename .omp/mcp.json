@@ -1,0 +1,4 @@
+{
+  "$schema": "https://raw.githubusercontent.com/can1357/oh-my-pi/v16.3.11/packages/coding-agent/src/config/mcp-schema.json",
+  "mcpServers": {}
+}

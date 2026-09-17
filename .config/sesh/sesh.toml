@@ -1,0 +1,11 @@
+#:schema https://github.com/joshmedeski/sesh/raw/main/sesh.schema.json
+
+# Show tmux sessions first, then learned zoxide dirs.
+sort_order = ["tmux", "zoxide"]
+
+# Hide tmux popup/picker scratch sessions from the picker.
+blacklist = ["_*"]
+
+[default_session]
+preview_command = "ls -la {}"
+disable_startup_command = true

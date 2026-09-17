@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+GAP_TITLE="__gap__"
+SIDEBAR_KIND="pi-sidebar"
+CURRENT_PANE=${TMUX_CONTEXT_PANE:-$(tmux display-message -p '#{pane_id}')}
+CURRENT_TITLE=$(tmux display-message -p -t "$CURRENT_PANE" '#{pane_title}')
+CURRENT_KIND=$(tmux display-message -p -t "$CURRENT_PANE" '#{@pi_sidebar_kind}')
+CURRENT_WINDOW=${TMUX_CONTEXT_WINDOW:-$(tmux display-message -p -t "$CURRENT_PANE" '#{window_id}')}
+CURRENT_SESSION=${TMUX_CONTEXT_SESSION:-$(tmux display-message -p -t "$CURRENT_PANE" '#{session_name}')}
+LAST_WINDOW=$(tmux list-windows -t "$CURRENT_SESSION" -F '#{window_id}\t#{window_last_flag}' | awk -F '\t' '$2 == "1" { print $1; exit }')
+REAL_PANES_IN_WINDOW=$(tmux list-panes -t "$CURRENT_WINDOW" -F '#{@pi_sidebar_kind}' | awk -v kind="$SIDEBAR_KIND" '$0 != kind { count++ } END { print count + 0 }')
+WINDOWS_IN_SESSION=$(tmux list-windows -t "$CURRENT_SESSION" | wc -l | tr -d ' ')
+
+if [ "$CURRENT_KIND" = "$SIDEBAR_KIND" ]; then
+  exit 0
+fi
+
+kill_popup_for_current_window() {
+  local popup_session="_popup_window_${CURRENT_WINDOW#@}"
+  tmux kill-session -t "$popup_session" 2>/dev/null || true
+}
+
+kill_sidebar_panes() {
+  local pane
+  while IFS= read -r pane; do
+    [ -n "$pane" ] && tmux kill-pane -t "$pane"
+  done < <(
+    tmux list-panes -t "$CURRENT_WINDOW" -F '#{pane_id} #{@pi_sidebar_kind}' \
+      | awk -v kind="$SIDEBAR_KIND" '$2 == kind { print $1 }'
+  )
+}
+
+neighbor_gap() {
+  local dir=$1 candidate title kind
+  if ! tmux select-pane -t "$CURRENT_PANE" 2>/dev/null; then
+    return 1
+  fi
+  if ! tmux select-pane -"$dir" 2>/dev/null; then
+    tmux select-pane -t "$CURRENT_PANE" 2>/dev/null || true
+    return 1
+  fi
+  candidate=$(tmux display-message -p -t "$CURRENT_WINDOW" '#{pane_id}')
+  title=$(tmux display-message -p -t "$candidate" '#{pane_title}')
+  kind=$(tmux display-message -p -t "$candidate" '#{@pi_sidebar_kind}')
+  tmux select-pane -t "$CURRENT_PANE" 2>/dev/null || true
+  [ "$title" = "$GAP_TITLE" ] && [ "$kind" != "$SIDEBAR_KIND" ] && printf '%s\n' "$candidate"
+}
+
+if [ "$CURRENT_TITLE" = "$GAP_TITLE" ]; then
+  tmux kill-pane -t "$CURRENT_PANE"
+  exit 0
+fi
+
+if [ "$REAL_PANES_IN_WINDOW" -gt 1 ]; then
+  GAP_PANE=$(neighbor_gap R || true)
+  [ -z "$GAP_PANE" ] && GAP_PANE=$(neighbor_gap D || true)
+  [ -z "$GAP_PANE" ] && GAP_PANE=$(neighbor_gap L || true)
+  [ -z "$GAP_PANE" ] && GAP_PANE=$(neighbor_gap U || true)
+  [ -n "$GAP_PANE" ] && tmux kill-pane -t "$GAP_PANE" 2>/dev/null || true
+  tmux kill-pane -t "$CURRENT_PANE"
+  exit 0
+fi
+
+if [ "$REAL_PANES_IN_WINDOW" -eq 1 ]; then
+  kill_sidebar_panes
+  tmux kill-pane -t "$CURRENT_PANE"
+  exit 0
+fi
+
+if [ "$WINDOWS_IN_SESSION" -gt 1 ]; then
+  kill_popup_for_current_window
+  tmux kill-window -t "$CURRENT_WINDOW"
+  [ -n "${LAST_WINDOW:-}" ] && tmux select-window -t "$LAST_WINDOW" 2>/dev/null || true
+  exit 0
+fi
+
+kill_popup_for_current_window
+tmux kill-session

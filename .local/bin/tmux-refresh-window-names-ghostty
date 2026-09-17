@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SOCK=${1:-ghostty-main}
+TMUX_SOCKET_PATH="/private/tmp/tmux-$(id -u)/${SOCK}"
+export TMUX="${TMUX_SOCKET_PATH},0,0"
+LOCK_FILE="/tmp/tmux-refresh-window-names-${SOCK}.lock"
+POPUP_JANITOR_LAST_RUN="/tmp/tmux-popup-janitor-${SOCK}.last-run"
+POPUP_JANITOR_INTERVAL_SECONDS=${POPUP_JANITOR_INTERVAL_SECONDS:-86400}
+
+if [ -f "$LOCK_FILE" ]; then
+  old_pid=$(cat "$LOCK_FILE" 2>/dev/null || true)
+  if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
+    exit 0
+  fi
+fi
+
+echo $$ > "$LOCK_FILE"
+trap 'rm -f "$LOCK_FILE"' EXIT
+
+run_daily_popup_janitor() {
+  local now last_run
+  now=$(date +%s)
+  last_run=0
+  if [ -f "$POPUP_JANITOR_LAST_RUN" ]; then
+    read -r last_run < "$POPUP_JANITOR_LAST_RUN" || last_run=0
+  fi
+  case ${last_run:-0} in
+    ''|*[!0-9]*) last_run=0 ;;
+  esac
+  if [ $((now - last_run)) -ge "$POPUP_JANITOR_INTERVAL_SECONDS" ]; then
+    printf '%s\n' "$now" > "$POPUP_JANITOR_LAST_RUN"
+    "$HOME/.local/bin/tmux-popup-janitor-ghostty" "$SOCK" >/dev/null 2>&1 || true
+  fi
+}
+
+while true; do
+  run_daily_popup_janitor
+  if tmux -L "$SOCK" list-sessions >/dev/null 2>&1; then
+    "$HOME/.local/bin/tmux-window-name-ghostty" --batch 2>/dev/null || true
+  fi
+  sleep 1
+done

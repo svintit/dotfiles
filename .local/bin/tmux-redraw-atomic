@@ -1,0 +1,229 @@
+#!/usr/bin/env python3
+"""Make outer-tmux cursor redraw cycles atomic for Ghostty.
+
+Buffer a complete cursor-hide ... cursor-show cycle. Remove only nested 2026
+markers inside that complete cycle, then wrap the cycle in one synchronized
+update. All screen bytes remain byte-identical. Incomplete cycles pass through
+unchanged after a short time or size limit.
+"""
+import fcntl
+import os
+import pty
+import select
+import signal
+import sys
+import termios
+import time
+import tty
+
+HIDE = b"\x1b[?25l"
+SHOW = b"\x1b[?25h"
+SYNC_BEGIN = b"\x1b[?2026h"
+SYNC_END = b"\x1b[?2026l"
+MAX_HOLD_SECONDS = 0.25
+MAX_HOLD_BYTES = 8 * 1024 * 1024
+SETTLE_SECONDS = 0.008
+
+class AtomicRedraw:
+    def __init__(self):
+        self.carry = b""
+        self.cycle = None
+        self.saw_show = False
+        self.started_at = 0.0
+        self.last_at = 0.0
+
+    @staticmethod
+    def _split_prefix_tail(data, tokens):
+        keep = 0
+        limit = min(len(data), max(len(token) for token in tokens) - 1)
+        for size in range(1, limit + 1):
+            suffix = data[-size:]
+            if any(token.startswith(suffix) for token in tokens):
+                keep = size
+        if keep:
+            return data[:-keep], data[-keep:]
+        return data, b""
+
+    @staticmethod
+    def _wrap(cycle):
+        frame = bytes(cycle)
+        frame = frame.replace(SYNC_BEGIN, b"").replace(SYNC_END, b"")
+        frame = frame.replace(HIDE, b"").replace(SHOW, b"")
+        # One write clears the old hardware cursor, commits the screen update,
+        # then shows exactly one cursor at the final restored position.
+        return HIDE + SYNC_BEGIN + frame + SYNC_END + SHOW
+
+    def _start_cycle(self):
+        self.cycle = bytearray(HIDE)
+        self.saw_show = False
+        now = time.monotonic()
+        self.started_at = now
+        self.last_at = now
+
+    def _complete_cycle(self):
+        output = self._wrap(self.cycle)
+        self.cycle = None
+        self.saw_show = False
+        self.started_at = 0.0
+        self.last_at = 0.0
+        return output
+
+    def transform(self, data):
+        buf = self.carry + data
+        self.carry = b""
+        out = bytearray()
+        self.last_at = time.monotonic()
+
+        while buf:
+            if self.cycle is None:
+                index = buf.find(HIDE)
+                if index < 0:
+                    ready, self.carry = self._split_prefix_tail(buf, (HIDE,))
+                    out.extend(ready)
+                    break
+                out.extend(buf[:index])
+                self._start_cycle()
+                buf = buf[index + len(HIDE):]
+                continue
+
+            if not self.saw_show:
+                index = buf.find(SHOW)
+                if index < 0:
+                    ready, self.carry = self._split_prefix_tail(buf, (SHOW,))
+                    self.cycle.extend(ready)
+                    break
+                self.cycle.extend(buf[:index + len(SHOW)])
+                self.saw_show = True
+                buf = buf[index + len(SHOW):]
+                continue
+
+            # Keep cursor-restore bytes after show in the same atomic frame.
+            # The next hide starts the next redraw cycle.
+            index = buf.find(HIDE)
+            if index < 0:
+                ready, self.carry = self._split_prefix_tail(buf, (HIDE,))
+                self.cycle.extend(ready)
+                break
+            self.cycle.extend(buf[:index])
+            out.extend(self._complete_cycle())
+            self._start_cycle()
+            buf = buf[index + len(HIDE):]
+
+        return bytes(out)
+
+    def overdue(self):
+        if self.cycle is None:
+            return False
+        now = time.monotonic()
+        if self.saw_show and now - self.last_at > SETTLE_SECONDS:
+            return True
+        return (now - self.started_at > MAX_HOLD_SECONDS or
+                len(self.cycle) + len(self.carry) > MAX_HOLD_BYTES)
+
+    def release(self):
+        if self.cycle is None:
+            return b""
+        if self.saw_show:
+            # Keep a possible partial next-hide token in carry. It must not be
+            # split by an injected synchronization marker.
+            return self._complete_cycle()
+        output = bytes(self.cycle) + self.carry
+        self.cycle = None
+        self.carry = b""
+        self.saw_show = False
+        self.started_at = 0.0
+        self.last_at = 0.0
+        return output
+
+    def finish(self):
+        out = bytearray()
+        if self.cycle is not None:
+            if self.saw_show:
+                out.extend(self._complete_cycle())
+            else:
+                out.extend(self.release())
+        out.extend(self.carry)
+        self.carry = b""
+        return bytes(out)
+
+
+def write_all(fd, data):
+    view = memoryview(data)
+    while view:
+        written = os.write(fd, view)
+        view = view[written:]
+
+
+def sync_winsize(master):
+    try:
+        size = fcntl.ioctl(0, termios.TIOCGWINSZ, b"\0" * 8)
+        fcntl.ioctl(master, termios.TIOCSWINSZ, size)
+    except OSError:
+        pass
+
+
+def main():
+    argv = sys.argv[1:]
+    if not argv:
+        sys.stderr.write("usage: tmux-redraw-atomic command [args...]\n")
+        return 2
+
+    pid, master = pty.fork()
+    if pid == 0:
+        os.execvp(argv[0], argv)
+
+    signal.signal(signal.SIGWINCH, lambda *_: sync_winsize(master))
+    sync_winsize(master)
+    old_term = None
+    try:
+        old_term = termios.tcgetattr(0)
+        tty.setraw(0)
+    except Exception:
+        pass
+
+    redraw = AtomicRedraw()
+    try:
+        while True:
+            timeout = 0.01 if redraw.cycle is not None else None
+            try:
+                ready, _, _ = select.select([0, master], [], [], timeout)
+            except InterruptedError:
+                continue
+            if 0 in ready:
+                data = os.read(0, 65536)
+                if not data:
+                    break
+                write_all(master, data)
+            if master in ready:
+                try:
+                    data = os.read(master, 65536)
+                except OSError:
+                    break
+                if not data:
+                    break
+                output = redraw.transform(data)
+                if output:
+                    write_all(1, output)
+            if redraw.overdue():
+                write_all(1, redraw.release())
+    finally:
+        output = redraw.finish()
+        if output:
+            try:
+                write_all(1, output)
+            except OSError:
+                pass
+        if old_term is not None:
+            try:
+                termios.tcsetattr(0, termios.TCSADRAIN, old_term)
+            except Exception:
+                pass
+    try:
+        os.waitpid(pid, 0)
+    except Exception:
+        pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

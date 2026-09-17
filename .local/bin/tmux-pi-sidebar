@@ -1,0 +1,2344 @@
+#!/usr/bin/env python3
+import fcntl
+import json
+import math
+import os
+import re
+import select
+import shlex
+import signal
+import subprocess
+import threading
+import sys
+import termios
+import time
+import tty
+from collections import defaultdict
+
+RESET = "\033[0m"
+HIDE_CURSOR = "\033[?25l"
+SHOW_CURSOR = "\033[?25h"
+CLEAR = "\033[2J\033[H"
+ENABLE_MOUSE = "\033[?1000h\033[?1006h"
+DISABLE_MOUSE = "\033[?1000l\033[?1006l"
+DIM = "\033[38;2;92;92;122m"
+MUTED = "\033[38;2;70;70;95m"
+HEADER = "\033[38;2;199;146;234m"
+AMBER = "\033[38;2;245;158;11m"
+GREEN = "\033[38;2;34;197;94m"
+RED = "\033[38;2;255;77;109m"
+CYAN = "\033[38;2;125;211;252m"
+WHITE = "\033[38;2;226;232;240m"
+FROZEN_TEXT = "\033[38;2;158;168;184m"
+FROZEN_BORDER = "\033[38;2;82;92;108m"
+BLUE = "\033[38;2;96;165;250m"
+UNREAD_DOT = "•"
+BG_SELECTED = "\033[48;2;26;36;48m"
+# Row number colour in both views. Neutral grey in the same family as the tmux
+# pane separator (`pane-border-style fg=#383838`), lifted to #5f5f5f because
+# the separator hex itself read as too faint here.
+NUM = "\033[38;2;95;95;95m"
+# The selected row sits on a lighter tinted background, so its number needs a
+# brighter grey to keep the same perceived weight.
+NUM_SELECTED = "\033[38;2;133;133;143m"
+STATE_FILE = "/tmp/pi-sidebar-state.json"
+STATE_LOCK = "/tmp/pi-sidebar-state.lock"
+SELECTION_HINT_FILE = "/tmp/pi-sidebar-selected-pane"
+FOCUS_STATE_FILE = "/tmp/pi-sidebar-focus-state"
+AI_NAME_CACHE_FILE = "/tmp/pi-sidebar-ai-names.json"
+AI_NAME_HELPER = os.path.expanduser("~/.local/bin/tmux-pi-sidebar-ai-name")
+FREEZE_REGISTRY_HELPER = os.path.expanduser("~/.local/bin/pi-session-freeze-registry")
+FREEZE_PROMPT_LOCK = "/tmp/pi-freeze-prompt.lock"
+FREEZE_PROMPT_COMMAND = (
+    "source ~/.config/fish/functions/__omp_resume_once.fish; "
+    "source ~/.config/fish/functions/__pi_freeze_prompt.fish; "
+    "__pi_freeze_prompt"
+)
+FREEZE_PROMPT_RETRY_MS = 5000
+CLOSED_PANES_FILE = "/tmp/pi-closed-panes.json"
+CLOSED_PANES_LOCK = "/tmp/pi-closed-panes.lock"
+MAX_CLOSED_PANES = 20
+_prev_pane_snapshot = {}
+_frozen_redraw_cache = {}
+
+SIDEBAR_TITLE = "__gap__"
+SIDEBAR_KIND = "pi-sidebar"
+AGENT_COMMANDS = {"pi", "node", "bun", "omp", "claude", "opencode", "codex"}
+COLLAPSE_BUTTON = "[«]"
+EXPAND_BUTTON = "[»]"
+SESSION_NEW_BUTTON = "< + >"
+# Pad the mouse hit box so the small button stays easy to click.
+BUTTON_HIT_SLACK = 2
+# ASCII art banner for "PI SESH" (figlet ANSI Shadow font, 47 cols wide).
+ASCII_ART = [
+    "██████╗ ██╗    ███████╗███████╗███████╗██╗  ██╗",
+    "██╔══██╗██║    ██╔════╝██╔════╝██╔════╝██║  ██║",
+    "██████╔╝██║    ███████╗█████╗  ███████╗███████║",
+    "██╔═══╝ ██║    ╚════██║██╔══╝  ╚════██║██╔══██║",
+    "██║     ██║    ███████║███████╗███████║██║  ██║",
+    "╚═╝     ╚═╝    ╚══════╝╚══════╝╚══════╝╚═╝  ╚═╝",
+]
+ASCII_ART_WIDTH = 47
+# Precomputed trace path: all shadow chars (╗╔╝╚═║) sorted by column
+# then row, so the tracer always sweeps left to right across the art.
+SHADOW_CHARS = set("╗╔╝╚═║")
+
+def _build_trace_path():
+    rows = len(ASCII_ART)
+    cols = len(ASCII_ART[0])
+    return sorted(
+        [(r, c) for r in range(rows) for c in range(cols) if ASCII_ART[r][c] in SHADOW_CHARS],
+        key=lambda cell: (cell[1], cell[0]),
+    )
+
+ART_TRACE_CELLS = _build_trace_path()
+ART_TRACE_LEN = len(ART_TRACE_CELLS)
+# Internal margins. LEFT and RIGHT are equal (3) so the whitespace on each side
+# of the sidebar/content divider matches; the sidebar pane is 1 col wider (53) to
+# keep the 47-col ASCII art fitting (53 - 3 - 3 = 47).
+LEFT_MARGIN = 3
+TOP_MARGIN = 1
+RIGHT_MARGIN = 3
+MODE = "collapsed" if "--collapsed" in sys.argv[1:] else "expanded"
+TMUX_SOCKET = os.environ.get("PI_SIDEBAR_TMUX_SOCKET", "")
+TMUX_COMMAND = ["tmux"] + (["-L", TMUX_SOCKET] if TMUX_SOCKET else [])
+TMUX_SHELL = shlex.join(TMUX_COMMAND)
+EXTERNAL_SIDEBAR = os.environ.get("PI_SIDEBAR_EXTERNAL") == "1"
+TARGET_CLIENT = os.environ.get("PI_SIDEBAR_CLIENT", "")
+SIDEBAR_CONTROL = os.environ.get(
+    "PI_SIDEBAR_CONTROL",
+    os.path.expanduser("~/.local/bin/tmux-pi-sidebar-toggle"),
+)
+
+# Labels rendered verbatim: never AI-shortened, never truncated to a name.
+LITERAL_LABELS = {"-", "~"}
+
+
+def tmux_command(*args):
+    return TMUX_COMMAND + list(args)
+
+# `--jump N` is a one-shot: resolve session number N and switch to it, no TUI.
+JUMP_NUMBER = None
+if "--jump" in sys.argv[1:]:
+    _jump_args = sys.argv[1:]
+    try:
+        JUMP_NUMBER = int(_jump_args[_jump_args.index("--jump") + 1])
+    except (IndexError, ValueError):
+        JUMP_NUMBER = None
+RESTORE_LAST = "--restore-last" in sys.argv[1:]
+PLAY_SOUND = "--play-sound" in sys.argv[1:]
+# Braille dot spinner frames for the "working" status icon.
+ANIM_FRAMES = ["⠖", "⠲", "⢲", "⢰", "⣰", "⣠", "⣄", "⣆", "⡆", "⡖"]
+SUBAGENT_ANIM_FRAMES = ["⠂", "⠆", "⡆", "⡄", "⡀", "⠠", "⠐", "⠈"]
+# OMP's native tmux title is the most direct busy signal. The status extension
+# can briefly write "completed" between continuation turns or background-agent
+# result deliveries, while OMP keeps the title spinner active. Prefer the native
+# spinner in that conflict so the sidebar never flashes a false green check.
+SCREEN_BUSY_RE = re.compile(r"^\s*[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]\s+\d+(?:s|m|h)\b", re.MULTILINE)
+NATIVE_TITLE_SPINNER_FRAMES = set("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
+SESH_PALETTE = [39, 45, 51, 75, 81, 114, 117, 150, 156, 180, 186, 210, 213, 215, 219, 222, 33, 69, 105, 111, 123, 141, 147, 159, 171, 177, 183, 195, 201, 207, 228, 229]
+MIN_COLOUR_DISTANCE_SQUARED = 140 * 140
+
+running = True
+# Do not show "done" until it stays stable beyond the status extension's 5s
+# retry window. This suppresses completed→working flashes between continuation
+# turns and background-agent result deliveries.
+COMPLETED_STABILITY_SECONDS = 6.0
+needs_redraw = True
+anim_frame = 0
+_art_phase = 0.0
+_pane_state = None
+FETCH_INTERVAL = 1.0
+ANIM_INTERVAL = 0.1
+_fetch_ready = threading.Event()
+_fetch_thread = None
+_wake_event = threading.Event()
+_selection_refresh_requested = threading.Event()
+_animations_paused = False
+_completion_pending_since = {}
+_last_raw_status = {}
+CLICK_TARGETS = {}
+SESSION_BUTTON_TARGETS = {}
+_collapse_button_row = 1
+last_sound_time_map = {}  # pane_id -> last sound timestamp, for 5s cooldown
+_ai_name_cache = {}
+_ai_queued = set()
+_registry_synced = {}
+
+
+class Pane:
+    def __init__(self, parts):
+        (
+            self.session,
+            self.window_index,
+            self.window_name,
+            self.pane_index,
+            self.pane_id,
+            self.pane_pid,
+            self.title,
+            self.command,
+            self.path,
+            self.pi_name,
+            self.pi_status,
+            self.joust_active_until,
+            self.slack_user,
+            self.manual_unread,
+            self.sidebar_kind,
+            self.pane_active,
+            self.window_active,
+            self.session_attached,
+            self.session_last_attached,
+            self.freeze_state,
+            self.freeze_resume_id,
+            self.freeze_cwd,
+            self.freeze_last_activity,
+            self.freeze_summary,
+            self.frozen_at,
+            self.freeze_prompt_active,
+            self.freeze_resume_started,
+        ) = parts
+        # Set by assign_numbers(); drives the ctrl+<n> jump bindings.
+        self.number = None
+        self.suppress_completed = False
+        self.live_omp = False
+        self.screen_busy = False
+    @property
+    def is_sidebar(self):
+        return self.sidebar_kind == SIDEBAR_KIND or self.title == SIDEBAR_TITLE
+
+    @property
+    def has_pi_metadata(self):
+        return bool(
+            self.pi_name
+            or self.pi_status
+            or self.slack_user
+            or self.freeze_state
+            or self.joust_active_until
+        )
+
+    @property
+    def is_pi_pane(self):
+        # Pi/OMP natively set the pane title to "π - <name> - <dir>" (pi)
+        # or "π: <name>" (omp), so we can detect sessions without any
+        # custom extension metadata.
+        return (self.title or "").startswith(("π ", "π:", "π-"))
+
+    @property
+    def is_agentish(self):
+        return self.command in AGENT_COMMANDS
+
+    @property
+    def is_current(self):
+        return (
+            self.pane_active == "1"
+            and self.window_active == "1"
+            and self.session_attached not in ("", "0")
+        )
+
+    @property
+    def is_frozen(self):
+        if self.live_omp:
+            return False
+        return self.freeze_state in {"freezing", "frozen"}
+
+    @property
+    def is_resuming(self):
+        return self.freeze_state == "resuming"
+
+
+    @property
+    def native_title_busy(self):
+        title = self.title or ""
+        return (
+            len(title) >= 3
+            and title.startswith("π ")
+            and title[2] in NATIVE_TITLE_SPINNER_FRAMES
+        )
+
+
+    @property
+    def joust_active(self):
+        try:
+            return int(self.joust_active_until) > int(time.time() * 1000)
+        except (TypeError, ValueError):
+            return False
+
+
+    @property
+    def display_status(self):
+        if self.is_frozen:
+            return "frozen"
+        if self.is_resuming:
+            return "working"
+        status = (self.pi_status or "").strip().lower()
+        if (self.native_title_busy or self.screen_busy) and status in {"", "done", "completed", "complete", "idle", "stopped", "error", "errored", "aborted"}:
+            return "working"
+        if self.joust_active and not (self.native_title_busy or self.screen_busy):
+            return "subagent_working"
+        if self.suppress_completed and status in {"done", "completed", "complete"}:
+            return "working"
+        if status == "asking":
+            return "asking"
+        if status in {"clock"}:
+            return "working"
+        if status in {"working", "running"}:
+            return "working"
+        if status in {"done", "completed", "complete"}:
+            return "done"
+        if status in {"blocked", "needs_input", "waiting"}:
+            return "blocked"
+        if status in {"stopped", "error", "errored", "aborted"}:
+            return "stopped"
+        if status in {"idle"}:
+            return "idle"
+        return "unknown"
+
+    @property
+    def source_label(self):
+        """The cleaned label to AI-shorten, or None when there is nothing to
+        shorten (slack handle, bare shell, or the no-name dir fallback)."""
+        if self.slack_user:
+            return None
+        # Prefer the pane title: for pi (π - <name> - <dir>) and omp (π: <name>)
+        # it carries the full name, while @pi_session_name is truncated by pi.
+        # The 2-part "π - <dir>" title (no name) collapses to "-" via clean_label.
+        # omp uses "π > <name>" (pi uses "π - <name> - <dir>"); both carry
+        # the full session name, while @pi_session_name is truncated.
+        if self.title and (self.title.startswith(("π: ", "π - ", "π- ", "π > "))):
+            return clean_label(self.title) or None
+        if self.pi_name:
+            return clean_label(self.pi_name)
+        if self.title and self.title not in {"fish", "bash", "zsh", "node", "pi"}:
+            return clean_label(self.title) or None
+        return None
+
+    @property
+    def context(self):
+        if self.slack_user:
+            return "@" + clean_token(self.slack_user, 32)
+        label = self.source_label
+        if label is None:
+            return f"pane {self.pane_index}"
+        if label in LITERAL_LABELS:
+            return label
+        # Use the AI-regenerated short name from the cache when available;
+        # otherwise return the full label and let truncate() handle width.
+        if label in _ai_name_cache:
+            return _ai_name_cache[label]
+        return label
+
+    @property
+    def target(self):
+        return f"{self.session}:{self.window_index}.{self.pane_index}"
+
+
+def on_signal(signum, frame):
+    global running
+    running = False
+    _wake_event.set()
+
+
+def on_winch(signum, frame):
+    global needs_redraw
+    needs_redraw = True
+    _wake_event.set()
+
+
+def on_selection_refresh(signum, frame):
+    _selection_refresh_requested.set()
+    _wake_event.set()
+
+def on_animation_focus(signum, frame):
+    global _animations_paused, needs_redraw
+    try:
+        with open(FOCUS_STATE_FILE, "r", encoding="utf-8") as fh:
+            _animations_paused = fh.read().strip() == "out"
+    except Exception:
+        _animations_paused = False
+    if not _animations_paused:
+        needs_redraw = True
+    _wake_event.set()
+
+
+def tmux_list_panes():
+    fmt = "\x1f".join([
+        "#{session_name}",
+        "#{window_index}",
+        "#{window_name}",
+        "#{pane_index}",
+        "#{pane_id}",
+        "#{pane_pid}",
+        "#{pane_title}",
+        "#{pane_current_command}",
+        "#{pane_current_path}",
+        "#{@pi_session_name}",
+        "#{@pi_agent_status}",
+        "#{@pi_pr_joust_active_until}",
+        "#{@pi_slack_thread_user}",
+        "#{@pi_sidebar_unread}",
+        "#{@pi_sidebar_kind}",
+        "#{pane_active}",
+        "#{window_active}",
+        "#{session_attached}",
+        "#{session_last_attached}",
+        "#{@pi_freeze_state}",
+        "#{@pi_freeze_resume_id}",
+        "#{@pi_freeze_cwd}",
+        "#{@pi_freeze_last_activity}",
+        "#{@pi_freeze_summary}",
+        "#{@pi_frozen_at}",
+        "#{@pi_freeze_prompt_active}",
+        "#{@pi_freeze_resume_started}",
+    ]) + "\x1e"
+    try:
+        result = subprocess.run(
+            tmux_command("list-panes", "-a", "-F", fmt),
+            capture_output=True,
+            text=True,
+            timeout=0.8,
+            check=False,
+        )
+    except Exception:
+        return []
+    if result.returncode != 0:
+        return []
+    panes = []
+    for record in result.stdout.split("\x1e\n"):
+        if not record:
+            continue
+        parts = record.split("\x1f")
+        if len(parts) != 27:
+            continue
+        pane = Pane(parts)
+        if pane.is_sidebar:
+            continue
+        if pane.session.startswith(("_", "pi-status-test")):
+            continue
+        if pane.has_pi_metadata or pane.is_pi_pane or pane.command == "pi":
+            panes.append(pane)
+    return panes
+
+def real_pane_for_window(window_id):
+    try:
+        result = subprocess.run(
+            tmux_command(
+                "list-panes",
+                "-t",
+                window_id,
+                "-F",
+                "#{pane_id}\t#{@pi_sidebar_kind}\t#{pane_active}",
+            ),
+            capture_output=True,
+            text=True,
+            timeout=0.5,
+            check=False,
+        )
+        candidates = []
+        for line in result.stdout.splitlines():
+            pane_id, kind, active = line.split("\t")
+            if kind != SIDEBAR_KIND:
+                candidates.append((active == "1", pane_id))
+        return max(candidates, default=(False, None))[1]
+    except Exception:
+        return None
+
+
+def fetch_selected_pane_id():
+    if TARGET_CLIENT:
+        try:
+            clients = subprocess.run(
+                tmux_command("list-clients", "-F", "#{client_name}\t#{session_name}"),
+                capture_output=True,
+                text=True,
+                timeout=0.5,
+                check=False,
+            )
+            target_session = None
+            for line in clients.stdout.splitlines():
+                client_name, _, session_name = line.partition("\t")
+                if client_name == TARGET_CLIENT:
+                    target_session = session_name
+                    break
+            if target_session:
+                result = subprocess.run(
+                    tmux_command(
+                        "display-message",
+                        "-p",
+                        "-t",
+                        target_session,
+                        "#{pane_id}\t#{@pi_sidebar_kind}\t#{window_id}",
+                    ),
+                    capture_output=True,
+                    text=True,
+                    timeout=0.5,
+                    check=False,
+                )
+                pane_id, kind, window_id = result.stdout.strip().split("\t")
+                if kind == SIDEBAR_KIND:
+                    pane_id = real_pane_for_window(window_id)
+                if pane_id and pane_id.startswith("%"):
+                    return pane_id
+        except Exception:
+            pass
+    fmt = "\t".join([
+        "#{pane_id}",
+        "#{pane_active}",
+        "#{window_active}",
+        "#{session_attached}",
+        "#{session_last_attached}",
+    ])
+    try:
+        result = subprocess.run(
+            tmux_command("list-panes", "-a", "-F", fmt),
+            capture_output=True,
+            text=True,
+            timeout=0.5,
+            check=False,
+        )
+    except Exception:
+        return None
+    candidates = []
+    for line in result.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) != 5:
+            continue
+        pane_id, pane_active, window_active, session_attached, last_attached = parts
+        if pane_active != "1" or window_active != "1" or session_attached in {"", "0"}:
+            continue
+        try:
+            candidates.append((int(last_attached or 0), pane_id))
+        except ValueError:
+            candidates.append((0, pane_id))
+    return max(candidates, default=(0, None))[1]
+
+
+def load_selected_hint():
+    try:
+        with open(SELECTION_HINT_FILE, "r", encoding="utf-8") as fh:
+            pane_id = fh.read().strip()
+        return pane_id if pane_id.startswith("%") else None
+    except Exception:
+        return None
+
+
+def publish_selected_hint(pane_id):
+    try:
+        tmp = f"{SELECTION_HINT_FILE}.{os.getpid()}.tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(pane_id + "\n")
+        os.replace(tmp, SELECTION_HINT_FILE)
+    except Exception:
+        pass
+
+
+def refresh_selected_pane():
+    global _pane_state
+    if _pane_state is None:
+        return
+    panes, color_map, grouped, _selected_pane_id, unread = _pane_state
+    selected_pane_id = load_selected_hint()
+    if selected_pane_id not in {pane.pane_id for pane in panes}:
+        selected_pane_id = fetch_selected_pane_id()
+    if selected_pane_id is not None:
+        _pane_state = panes, color_map, grouped, selected_pane_id, unread
+
+
+def register_sidebar_pid():
+    try:
+        if EXTERNAL_SIDEBAR:
+            subprocess.run(
+                tmux_command("set-option", "-gq", "@pi_sidebar_external_pid", str(os.getpid())),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=0.5,
+                check=False,
+            )
+            return
+        pane_id = os.environ.get("TMUX_PANE", "")
+        if not pane_id:
+            return
+        subprocess.run(
+            tmux_command("set-option", "-pq", "-t", pane_id, "@pi_sidebar_pid", str(os.getpid())),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=0.5,
+            check=False,
+        )
+        subprocess.run(
+            tmux_command("set-option", "-wq", "-t", pane_id, "@pi_sidebar_pid", str(os.getpid())),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=0.5,
+            check=False,
+        )
+    except Exception:
+        pass
+
+def unregister_sidebar_pid():
+    if not EXTERNAL_SIDEBAR:
+        return
+    try:
+        result = subprocess.run(
+            tmux_command("show-option", "-gqv", "@pi_sidebar_external_pid"),
+            capture_output=True,
+            text=True,
+            timeout=0.5,
+            check=False,
+        )
+        if result.stdout.strip() == str(os.getpid()):
+            subprocess.run(
+                tmux_command("set-option", "-gu", "@pi_sidebar_external_pid"),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=0.5,
+                check=False,
+            )
+    except Exception:
+        pass
+
+
+def clean_token(value, limit):
+    value = (value or "").strip().lstrip("@")
+    keep = []
+    for ch in value:
+        if ch.isalnum() or ch in "._-":
+            keep.append(ch)
+        elif ch.isspace():
+            keep.append("-")
+    return truncate("".join(keep).strip("-"), limit)
+
+
+def limit_words(text, max_words):
+    words = text.split()
+    if len(words) <= max_words:
+        return text
+    return " ".join(words[:max_words]) + "…"
+GENERIC_NAMES = {"src", "main", "root", "master", "trunk", "default", "pi", "omp", "dev", "world"}
+HOME_BASENAME = os.path.basename(os.path.normpath(os.path.expanduser("~")))
+
+def clean_label(value):
+    value = (value or "").strip()
+    if " // " in value:
+        value = value.split(" // ", 1)[1].strip()
+    if value.startswith("π - "):
+        parts = value.split(" - ")
+        if len(parts) >= 3:
+            value = " - ".join(parts[1:-1]).strip()
+        else:
+            # 2-part "π - <dir>" means pi had no session name, so the title
+            # collapsed to the dir basename (e.g. "src").
+            if len(parts) > 1 and parts[1].strip() == HOME_BASENAME:
+                return "~"
+            return "-"
+    elif value.startswith("π: "):
+        value = value[3:].strip()
+    elif value.startswith("π > "):
+        # omp format "π > <name>"; strip the prefix.
+        value = value[4:].strip()
+    # Reject generic names that are just directory names or defaults
+    # (e.g. omp title "π: src" when no session name has been set yet).
+    # omp/pi fall back to the cwd basename; show home as "~", not the username.
+    if value == HOME_BASENAME:
+        return "~"
+    if value.lower() in GENERIC_NAMES:
+        return "-"
+    return value.strip()
+
+
+def truncate(value, width):
+    if width <= 0:
+        return ""
+    if len(value) <= width:
+        return value
+    if width == 1:
+        return "…"
+    return value[: width - 1].rstrip("- ") + "…"
+
+
+def visible_len(value):
+    plain = re.sub(r"\033\[[0-9;?]*[A-Za-z]", "", value)
+    return len(plain.replace("\ufe0e", "").replace("\ufe0f", ""))
+
+def fit(line, width):
+    raw = line
+    if visible_len(raw) <= width:
+        return raw
+    # Keep this simple because ANSI color segments make exact truncation fussy.
+    plain = re.sub(r"\033\[[0-9;?]*[A-Za-z]", "", raw)
+    return truncate(plain, width)
+
+def pad_visible(text, width):
+    """Pad text with spaces to reach the given visible width."""
+    return text + " " * max(0, width - visible_len(text))
+
+ART_TRACE_BRIGHT = "\033[38;2;245;230;255m"
+ART_TRACE_TAIL = "\033[38;2;220;190;250m"
+# Dark and light endpoints for the subtle base color oscillation.
+ART_BASE_DARK = (130, 50, 210)
+ART_BASE_LIGHT = (220, 70, 170)
+_art_color_phase = 0
+
+def advance_animation(frame_count=1):
+    global anim_frame, _art_phase, _art_color_phase
+    anim_frame = (anim_frame + frame_count) % len(ANIM_FRAMES)
+    _art_phase = (_art_phase + 1.5 * frame_count) % ART_TRACE_LEN
+    _art_color_phase = (_art_color_phase + frame_count) % 400
+
+def _art_base_color():
+    t = _art_color_phase / 400.0
+    wave = (math.sin(t * 2 * math.pi) + 1) / 2
+    r = int(ART_BASE_DARK[0] + wave * (ART_BASE_LIGHT[0] - ART_BASE_DARK[0]))
+    g = int(ART_BASE_DARK[1] + wave * (ART_BASE_LIGHT[1] - ART_BASE_DARK[1]))
+    b = int(ART_BASE_DARK[2] + wave * (ART_BASE_LIGHT[2] - ART_BASE_DARK[2]))
+    return f"\033[38;2;{r};{g};{b}m"
+
+def tracer_art_lines(pad):
+    """ASCII art with a bright tracer dot traveling along the character
+    outlines, leaving a short comet tail behind."""
+    head = int(_art_phase)
+    trace = {}
+    for offset in range(7):
+        idx = (head - offset) % ART_TRACE_LEN
+        li, ci = ART_TRACE_CELLS[idx]
+        if ASCII_ART[li][ci] in SHADOW_CHARS:
+            trace[(li, ci)] = ART_TRACE_BRIGHT if offset <= 1 else ART_TRACE_TAIL
+    base = _art_base_color()
+    result = []
+    for li, line in enumerate(ASCII_ART):
+        line_trace = {ci: col for (l, ci), col in trace.items() if l == li}
+        if not line_trace:
+            result.append(f"{base}{pad}{line}{RESET}")
+            continue
+        parts = [pad, base]
+        prev = base
+        for ci, ch in enumerate(line):
+            col = line_trace.get(ci, base)
+            if col != prev:
+                parts.append(col)
+                prev = col
+            parts.append(ch)
+        parts.append(RESET)
+        result.append("".join(parts))
+    return result
+
+
+def header_lines(width):
+    """Return list of header line strings (ASCII art banner or plain fallback)."""
+    global _collapse_button_row
+    if width >= ASCII_ART_WIDTH:
+        # Collapse button on the first line, right-aligned.
+        btn_gap = max(0, width - len(COLLAPSE_BUTTON))
+        result = [f"{' ' * btn_gap}{RED}{COLLAPSE_BUTTON}{RESET}", ""]
+        _collapse_button_row = 1
+        offset = (width - ASCII_ART_WIDTH) // 2
+        pad = " " * offset
+        result.extend(tracer_art_lines(pad))
+        return result
+    # Fallback: plain text title with button on a single line.
+    title = "PI SESH"
+    if width < len(title) + len(COLLAPSE_BUTTON) + 1:
+        _collapse_button_row = 1
+        return [f"{HEADER}{truncate(title, width)}{RESET}"]
+    gap = max(1, width - len(title) - len(COLLAPSE_BUTTON))
+    _collapse_button_row = 1
+    return [f"{HEADER}{title}{RESET}{' ' * gap}{RED}{COLLAPSE_BUTTON}{RESET}"]
+
+
+def status_icon(status):
+    return {
+        "asking": ("?", AMBER, "asking"),
+        "clock": ("⏱", AMBER, "clock"),
+        "working": (ANIM_FRAMES[anim_frame % len(ANIM_FRAMES)], AMBER, "working"),
+        "subagent_working": (SUBAGENT_ANIM_FRAMES[anim_frame % len(SUBAGENT_ANIM_FRAMES)], CYAN, "subagent working"),
+        "blocked": ("◆", AMBER, "blocked"),
+        "done": ("✓", GREEN, "done"),
+        "frozen": ("󰜗", CYAN, "frozen"),
+        "stopped": ("■", RED, "stopped"),
+        "idle": ("○", DIM, "idle"),
+        "unknown": ("·", DIM, status),
+    }.get(status, ("·", DIM, status))
+
+
+def short_session(session, width):
+    return truncate(session, width)
+
+
+def cksum_value(text):
+    try:
+        result = subprocess.run(
+            ["cksum"],
+            input=text,
+            capture_output=True,
+            text=True,
+            timeout=0.3,
+            check=False,
+        )
+        if result.returncode == 0:
+            return int(result.stdout.split()[0])
+    except Exception:
+        pass
+    # Fallback only if cksum is unavailable.
+    value = 0
+    for ch in text:
+        value = (value * 33 + ord(ch)) & 0xFFFFFFFF
+    return value
+
+
+def xterm_colour_to_rgb(code):
+    if 16 <= code <= 231:
+        offset = code - 16
+        r_component = offset // 36
+        g_component = (offset // 6) % 6
+        b_component = offset % 6
+        r = 0 if r_component == 0 else 55 + r_component * 40
+        g = 0 if g_component == 0 else 55 + g_component * 40
+        b = 0 if b_component == 0 else 55 + b_component * 40
+        return r, g, b
+    if 232 <= code <= 255:
+        value = 8 + (code - 232) * 10
+        return value, value, value
+    return 255, 255, 255
+
+def tinted_bg(session_colour_code):
+    """Blend the session's xterm colour with the dark base to tint the selected-row background."""
+    base_r, base_g, base_b = 26, 36, 48
+    if session_colour_code is None:
+        return BG_SELECTED
+    r, g, b = xterm_colour_to_rgb(session_colour_code)
+    alpha = 0.15
+    tr = int(base_r * (1 - alpha) + r * alpha)
+    tg = int(base_g * (1 - alpha) + g * alpha)
+    tb = int(base_b * (1 - alpha) + b * alpha)
+    return f"\033[48;2;{tr};{tg};{tb}m"
+
+
+def colours_too_similar(candidate, used):
+    cr, cg, cb = xterm_colour_to_rgb(candidate)
+    ur, ug, ub = xterm_colour_to_rgb(used)
+    distance = (cr - ur) ** 2 + (cg - ug) ** 2 + (cb - ub) ** 2
+    return distance < MIN_COLOUR_DISTANCE_SQUARED
+
+
+def colour_is_distinct(candidate, used_codes):
+    if candidate in used_codes:
+        return False
+    return not any(colours_too_similar(candidate, used) for used in used_codes)
+
+
+def pick_sesh_colour(hash_value, used_codes):
+    palette_size = len(SESH_PALETTE)
+    start = hash_value % palette_size
+    for offset in range(palette_size):
+        candidate = SESH_PALETTE[(start + offset) % palette_size]
+        if colour_is_distinct(candidate, used_codes):
+            used_codes.append(candidate)
+            return candidate
+    for offset in range(palette_size):
+        candidate = SESH_PALETTE[(start + offset) % palette_size]
+        if candidate not in used_codes:
+            used_codes.append(candidate)
+            return candidate
+    for candidate in range(16, 232):
+        if colour_is_distinct(candidate, used_codes):
+            used_codes.append(candidate)
+            return candidate
+    for candidate in range(16, 232):
+        if candidate not in used_codes:
+            used_codes.append(candidate)
+            return candidate
+    return SESH_PALETTE[start]
+
+
+def sesh_picker_session_order():
+    try:
+        result = subprocess.run(
+            tmux_command("list-sessions", "-F", "#{session_last_attached} #S"),
+            capture_output=True,
+            text=True,
+            timeout=0.5,
+            check=False,
+        )
+    except Exception:
+        return []
+    if result.returncode != 0:
+        return []
+    sessions = []
+    for line in result.stdout.splitlines():
+        if not line.strip():
+            continue
+        timestamp, _, name = line.partition(" ")
+        if not name or name.startswith("_"):
+            continue
+        try:
+            attached_at = int(timestamp or "0")
+        except ValueError:
+            attached_at = 0
+        sessions.append((attached_at, name))
+    sessions.sort(key=lambda item: item[0], reverse=True)
+    names = [name for _, name in sessions]
+    # Match the sesh picker alt-tab ordering: previous session first, current second.
+    if len(names) >= 2:
+        names[0], names[1] = names[1], names[0]
+    return names
+
+
+_SESH_COLOUR_CACHE_KEY = None
+_SESH_COLOUR_CACHE = None
+
+
+def sesh_colour_map(extra_sessions):
+    global _SESH_COLOUR_CACHE_KEY, _SESH_COLOUR_CACHE
+    # Colors are deterministic per set of session names. Recomputing shells out
+    # to `tmux list-sessions` plus one `cksum` per session, so cache by the
+    # frozenset of session names and reuse across redraws. Only recompute when
+    # the set changes (new/removed session).
+    key = frozenset(extra_sessions)
+    if key == _SESH_COLOUR_CACHE_KEY and _SESH_COLOUR_CACHE is not None:
+        return _SESH_COLOUR_CACHE
+    used_codes = []
+    colors = {}
+    ordered = []
+    seen = set()
+    for name in sesh_picker_session_order() + list(extra_sessions):
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        ordered.append(name)
+    for name in ordered:
+        colors[name] = pick_sesh_colour(cksum_value(name), used_codes)
+    _SESH_COLOUR_CACHE_KEY = key
+    _SESH_COLOUR_CACHE = colors
+    return colors
+
+
+STATUS_PRIORITY = {
+    "asking": 0,
+    "working": 1,
+    "blocked": 2,
+    "stopped": 3,
+    "done": 4,
+    "idle": 5,
+    "unknown": 6,
+}
+
+
+def session_header_line(session, panes, width, color_map):
+    session_colour = color_map.get(session)
+    session_style = f"\033[38;5;{session_colour}m" if session_colour is not None else CYAN
+    all_frozen = bool(panes) and all(pane.is_frozen for pane in panes)
+    title_style = FROZEN_TEXT if all_frozen else session_style
+    title_weight = "" if all_frozen else "\033[1m"
+    count = f"({len(panes)})" if len(panes) > 1 else ""
+    available = max(1, width - (len(count) + 1 if count else 0))
+    label = truncate(session, available)
+    suffix = f" {DIM}{count}{RESET}" if count else ""
+    return f"{title_weight}{title_style}{label}{RESET}{suffix}"
+
+
+def row_lines_for_pane(pane, width, is_unread=False, is_selected=False):
+    status = pane.display_status
+    if is_unread:
+        indent = f"{BLUE}{UNREAD_DOT}{RESET} "
+    else:
+        indent = "  "
+    icon, color, _label = status_icon(status)
+    num_style = NUM_SELECTED if is_selected else NUM
+    number = f"{num_style}{str(pane.number or '').rjust(2)}{RESET}"
+    label_width = max(4, width - visible_len(indent) - 6)
+    label = truncate(pane.context, label_width)
+    label_style = FROZEN_TEXT if status == "frozen" else WHITE
+    return [
+        f" {number} {indent}{color}{icon}{RESET} {label_style}{label}{RESET}",
+    ]
+
+
+def load_state_locked():
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return (
+            dict(data.get("unread", {})),
+            dict(data.get("last_status", {})),
+            dict(data.get("numbers", {})),
+            dict(data.get("manual_seen", {})),
+        )
+    except Exception:
+        return {}, {}, {}, {}
+
+
+def load_number_map():
+    """number (as a string) -> pane_id, as last rendered by a sidebar process."""
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as fh:
+            return dict(json.load(fh).get("numbers", {}))
+    except Exception:
+        return {}
+
+
+def save_state_locked(unread, last_status, numbers, manual_seen):
+    try:
+        tmp = f"{STATE_FILE}.{os.getpid()}.tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(
+                {
+                    "unread": unread,
+                    "last_status": last_status,
+                    "numbers": numbers,
+                    "manual_seen": manual_seen,
+                },
+                fh,
+            )
+            fh.write("\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, STATE_FILE)
+    except Exception:
+        pass
+
+
+def play_status_sound_worker():
+    sound = "/System/Library/Sounds/Glass.aiff"
+    afplay = shutil.which("afplay")
+    if afplay:
+        try:
+            with open("/tmp/pi-sidebar-sound.lock", "w", encoding="utf-8") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                subprocess.run(
+                    [afplay, "-v", "1.0", sound],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=5,
+                    check=False,
+                )
+        except (OSError, subprocess.SubprocessError):
+            pass
+        return
+
+    for command, args in [
+        ("paplay", ["/usr/share/sounds/freedesktop/stereo/bell.oga"]),
+        ("aplay", ["/usr/share/sounds/speech-dispatcher/test.wav"]),
+    ]:
+        executable = shutil.which(command)
+        if executable:
+            subprocess.run(
+                [executable] + args,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+                check=False,
+            )
+            return
+
+
+def play_status_sound():
+    try:
+        subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__), "--play-sound"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError:
+        pass
+
+def clear_manual_unread_marker(pane_id):
+    try:
+        subprocess.run(
+            tmux_command("set-option", "-pu", "-t", pane_id, "@pi_sidebar_unread"),
+            capture_output=True,
+            timeout=0.5,
+            check=False,
+        )
+    except Exception:
+        pass
+
+def update_unread_state(panes, selected_pane_id, numbers=None):
+    """Track automatic status changes and explicit unread markers."""
+    try:
+        lock_fh = open(STATE_LOCK, "w", encoding="utf-8")
+        fcntl.flock(lock_fh, fcntl.LOCK_EX)
+    except Exception:
+        return {}
+    try:
+        unread, last_status, prev_numbers, manual_seen = load_state_locked()
+        prev_unread = dict(unread)
+        prev_last_status = dict(last_status)
+        prev_manual_seen = {
+            pid: dict(entry) if isinstance(entry, dict) else entry
+            for pid, entry in manual_seen.items()
+        }
+        numbers = prev_numbers if numbers is None else numbers
+        markers_to_clear = []
+        current_ids = {p.pane_id for p in panes}
+        for pid in list(last_status.keys()):
+            if pid not in current_ids:
+                last_status.pop(pid, None)
+                unread.pop(pid, None)
+        for pid in list(manual_seen.keys()):
+            if pid not in current_ids:
+                manual_seen.pop(pid, None)
+        for pane in panes:
+            pid = pane.pane_id
+            cur = pane.display_status
+            prev = last_status.get(pid)
+            if prev is not None and prev != cur:
+                is_clock_transition = prev == "clock" or cur == "clock"
+                is_freeze_transition = cur == "frozen"
+                is_unread = (pid != selected_pane_id) and not is_clock_transition and not is_freeze_transition
+                unread[pid] = is_unread
+                if is_unread and cur != "working" and cur and not is_clock_transition and not is_freeze_transition:
+                    now = time.monotonic()
+                    last_sound_time = last_sound_time_map.get(pid, 0)
+                    if now - last_sound_time >= 5.0:
+                        play_status_sound()
+                        last_sound_time_map[pid] = now
+            if pid == selected_pane_id:
+                unread[pid] = False
+            if cur == "asking" and pid != selected_pane_id:
+                unread[pid] = True
+            if cur == "working":
+                unread[pid] = False
+            if cur == "frozen":
+                unread[pid] = False
+            if cur:
+                last_status[pid] = cur
+
+            manual_token = (pane.manual_unread or "").strip()
+            if not manual_token:
+                manual_seen.pop(pid, None)
+                continue
+            entry = manual_seen.get(pid)
+            if not isinstance(entry, dict) or entry.get("token") != manual_token:
+                manual_seen[pid] = {
+                    "token": manual_token,
+                    "left": pid != selected_pane_id,
+                }
+                unread[pid] = True
+            elif pid == selected_pane_id and entry.get("left"):
+                unread[pid] = False
+                manual_seen.pop(pid, None)
+                markers_to_clear.append(pid)
+            else:
+                if pid != selected_pane_id:
+                    entry["left"] = True
+                unread[pid] = True
+
+        if unread != prev_unread or last_status != prev_last_status or numbers != prev_numbers or manual_seen != prev_manual_seen:
+            save_state_locked(unread, last_status, numbers, manual_seen)
+        for pid in markers_to_clear:
+            clear_manual_unread_marker(pid)
+        return unread
+    finally:
+        try:
+            fcntl.flock(lock_fh, fcntl.LOCK_UN)
+            lock_fh.close()
+        except Exception:
+            pass
+
+
+def load_ai_name_cache():
+    global _ai_name_cache
+    try:
+        with open(AI_NAME_CACHE_FILE, "r") as f:
+            _ai_name_cache = json.load(f)
+    except Exception:
+        pass
+
+
+def queue_ai_names(panes):
+    """Fork the AI helper for any session label (pi or omp) not yet cached or
+    queued. The helper regenerates a short descriptive name."""
+    if not os.path.isfile(AI_NAME_HELPER):
+        return
+    for pane in panes:
+        label = pane.source_label
+        if not label or label in LITERAL_LABELS or label in _ai_name_cache or label in _ai_queued:
+            continue
+        _ai_queued.add(label)
+        try:
+            subprocess.Popen(
+                ["python3", AI_NAME_HELPER, label],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            pass
+
+def group_panes(panes):
+    """Group panes by session, keeping `tmux list-panes -a` order."""
+    grouped = {}
+    for pane in panes:
+        grouped.setdefault(pane.session, []).append(pane)
+    return grouped
+
+
+def assign_numbers(grouped):
+    """Number every pane 1..N in render order and return the flat list.
+
+    The same order drives the expanded rows, the collapsed rows and the
+    ctrl+<n> jump bindings, so all three always agree.
+    """
+    ordered = [pane for session_panes in grouped.values() for pane in session_panes]
+    for index, pane in enumerate(ordered, start=1):
+        pane.number = index
+    return ordered
+
+
+
+
+def stabilize_completed_status(panes):
+    """Delay completed transitions and prefer OMP's native busy title."""
+    now = time.monotonic()
+    live_ids = {pane.pane_id for pane in panes}
+    completed_values = {"done", "completed", "complete"}
+
+
+    for pane in panes:
+        pane.suppress_completed = False
+        pane_id = pane.pane_id
+        raw_status = (pane.pi_status or "").strip().lower()
+        previous = _last_raw_status.get(pane_id)
+
+
+        if pane.native_title_busy:
+            if raw_status in completed_values:
+                _completion_pending_since.setdefault(pane_id, now)
+            else:
+                _completion_pending_since.pop(pane_id, None)
+        elif raw_status in completed_values and previous is not None and previous not in completed_values:
+            _completion_pending_since[pane_id] = now
+            pane.suppress_completed = True
+        elif raw_status in completed_values and pane_id in _completion_pending_since:
+            elapsed = now - _completion_pending_since[pane_id]
+            if elapsed < COMPLETED_STABILITY_SECONDS:
+                pane.suppress_completed = True
+            else:
+                _completion_pending_since.pop(pane_id, None)
+        elif raw_status not in completed_values:
+            _completion_pending_since.pop(pane_id, None)
+
+
+        _last_raw_status[pane_id] = raw_status
+
+    for pane_id in set(_last_raw_status) - live_ids:
+        _last_raw_status.pop(pane_id, None)
+        _completion_pending_since.pop(pane_id, None)
+
+
+def live_omp_pane_ids(panes):
+    roots = {}
+    for pane in panes:
+        try:
+            roots[int(pane.pane_pid)] = pane.pane_id
+        except (TypeError, ValueError):
+            continue
+    if not roots:
+        return set()
+    try:
+        result = subprocess.run(
+            ["ps", "-axo", "pid=,ppid=,command="],
+            capture_output=True,
+            text=True,
+            timeout=1,
+            check=False,
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    parents = {}
+    omp_pids = []
+    for line in result.stdout.splitlines():
+        parts = line.strip().split(None, 2)
+        if len(parts) != 3:
+            continue
+        try:
+            pid = int(parts[0])
+            parents[pid] = int(parts[1])
+        except ValueError:
+            continue
+        if "omp --bun" in parts[2]:
+            omp_pids.append(pid)
+    live = set()
+    for pid in omp_pids:
+        seen = set()
+        while pid > 1 and pid not in seen:
+            seen.add(pid)
+            pane_id = roots.get(pid)
+            if pane_id:
+                live.add(pane_id)
+                break
+            pid = parents.get(pid, 0)
+    return live
+
+
+def reconcile_frozen_state(panes):
+    live_ids = live_omp_pane_ids(panes)
+    if live_ids is None:
+        return False
+    for pane in panes:
+        pane.live_omp = pane.pane_id in live_ids
+    return True
+
+def detect_screen_busy(panes):
+    final_statuses = {"", "done", "completed", "complete", "idle", "stopped", "error", "errored", "aborted"}
+    for pane in panes:
+        pane.screen_busy = False
+        status = (pane.pi_status or "").strip().lower()
+        if not pane.live_omp or status not in final_statuses:
+            continue
+        try:
+            result = subprocess.run(
+                tmux_command("capture-pane", "-p", "-t", pane.pane_id, "-S", "-8"),
+                capture_output=True,
+                text=True,
+                timeout=0.5,
+                check=False,
+            )
+            pane.screen_busy = result.returncode == 0 and bool(SCREEN_BUSY_RE.search(result.stdout))
+        except Exception:
+            pass
+
+
+
+def sync_frozen_registry(panes):
+    live_keys = set()
+    for pane in panes:
+        if pane.live_omp or pane.freeze_state != "frozen" or not pane.freeze_resume_id:
+            continue
+        frozen_at = pane.frozen_at or pane.freeze_last_activity or str(int(time.time() * 1000))
+        key = (pane.freeze_resume_id, frozen_at)
+        live_keys.add(key)
+        if _registry_synced.get(pane.freeze_resume_id) == frozen_at:
+            continue
+        try:
+            result = subprocess.run(
+                [
+                    FREEZE_REGISTRY_HELPER,
+                    "freeze",
+                    pane.freeze_resume_id,
+                    "--cwd",
+                    pane.freeze_cwd or pane.path,
+                    "--title",
+                    pane.title,
+                    "--at",
+                    frozen_at,
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=2,
+                check=False,
+            )
+            if result.returncode == 0:
+                _registry_synced[pane.freeze_resume_id] = frozen_at
+        except Exception:
+            pass
+    active_ids = {session_id for session_id, _frozen_at in live_keys}
+    for session_id in set(_registry_synced) - active_ids:
+        _registry_synced.pop(session_id, None)
+
+
+def pane_option(pane, key):
+    try:
+        return subprocess.run(
+            tmux_command("show-option", "-pqv", "-t", pane.pane_id, key),
+            capture_output=True,
+            text=True,
+            timeout=0.5,
+            check=False,
+        ).stdout.strip()
+    except Exception:
+        return ""
+def _frozen_elapsed_display(frozen_at_str):
+    try:
+        ts = int(frozen_at_str)
+    except (TypeError, ValueError):
+        return ""
+    if not ts:
+        return ""
+    seconds = max(0, int(time.time() * 1000) - ts) / 1000
+    minutes = int(seconds // 60)
+    if minutes < 1:
+        return "Frozen for <1m"
+    if minutes < 60:
+        return f"Frozen for {minutes}m"
+    hours = minutes // 60
+    mins = minutes % 60
+    if hours < 24:
+        return f"Frozen for {hours}h {mins}m"
+    days = hours // 24
+    hrs = hours % 24
+    return f"Frozen for {days}d {hrs}h {mins}m"
+
+def ensure_frozen_prompts(panes):
+    now_ms = int(time.time() * 1000)
+    try:
+        with open(FREEZE_PROMPT_LOCK, "w") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return
+            waiting_ids = set()
+            for pane in panes:
+                if pane.live_omp or not pane.is_frozen:
+                    continue
+                active = pane.freeze_prompt_active
+                if active.startswith("waiting:"):
+                    waiting_ids.add(pane.pane_id)
+                    try:
+                        fish_pid = int(active.split(":", 1)[1])
+                        os.kill(fish_pid, 0)
+                    except (OSError, ValueError):
+                        pass
+                    else:
+                        summary = pane.freeze_summary or pane.pi_name
+                        visible = (
+                            pane.window_active == "1"
+                            and pane.session_attached not in ("", "0")
+                        )
+                        elapsed = _frozen_elapsed_display(pane.frozen_at)
+                        sig = (fish_pid, summary, elapsed, visible)
+                        cached = _frozen_redraw_cache.get(pane.pane_id)
+                        _frozen_redraw_cache[pane.pane_id] = sig
+                        if cached != sig and visible:
+                            os.kill(fish_pid, signal.SIGWINCH)
+                        continue
+                try:
+                    if active and now_ms - int(active) < FREEZE_PROMPT_RETRY_MS:
+                        continue
+                except ValueError:
+                    pass
+                set_pane_option(pane, "@pi_freeze_prompt_active", str(now_ms))
+                try:
+                    subprocess.run(
+                        tmux_command(
+                            "send-keys",
+                            "-t",
+                            pane.pane_id,
+                            "-l",
+                            FREEZE_PROMPT_COMMAND + "\r",
+                        ),
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=1,
+                        check=False,
+                    )
+                except Exception:
+                    set_pane_option(pane, "@pi_freeze_prompt_active", "")
+            for pid in list(_frozen_redraw_cache):
+                if pid not in waiting_ids:
+                    del _frozen_redraw_cache[pid]
+    except Exception:
+        pass
+
+def keep_sidebar_pane(pane):
+    # OMP panes keep a resume ID after normal exit. Show them only while the
+    # process is live or the pane has an explicit freeze/resume state.
+    if not pane.freeze_resume_id:
+        return True
+    if pane.live_omp or pane.freeze_state in {"freezing", "frozen", "resuming"}:
+        return True
+    # Dead OMP pane with a resume ID: still show it if Pi metadata or a pi
+    # title is present so the session stays visible and clickable for resume.
+    return pane.has_pi_metadata or pane.is_pi_pane
+
+
+def fetch_pane_state():
+    panes = tmux_list_panes()
+    live_detection_ok = reconcile_frozen_state(panes)
+    detect_screen_busy(panes)
+    if live_detection_ok:
+        sync_frozen_registry(panes)
+        ensure_frozen_prompts(panes)
+    panes = [pane for pane in panes if keep_sidebar_pane(pane)]
+    stabilize_completed_status(panes)
+    load_ai_name_cache()
+    queue_ai_names(panes)
+    color_map = sesh_colour_map([pane.session for pane in panes])
+    grouped = group_panes(panes)
+    ordered = assign_numbers(grouped)
+    numbers = {str(pane.number): pane.pane_id for pane in ordered}
+    if TARGET_CLIENT:
+        selected_pane_id = fetch_selected_pane_id()
+    else:
+        current_panes = [p for p in panes if p.is_current]
+        selected = max(current_panes, key=lambda p: int(p.session_last_attached or 0), default=None)
+        selected_pane_id = selected.pane_id if selected else None
+    unread = update_unread_state(panes, selected_pane_id, numbers)
+    return panes, color_map, grouped, selected_pane_id, unread
+
+
+def render_expanded(width, height, state=None):
+    global CLICK_TARGETS, SESSION_BUTTON_TARGETS
+    CLICK_TARGETS = {}
+    SESSION_BUTTON_TARGETS = {}
+    # Keep the true pane width; the selected-row highlight spans it edge to edge.
+    pane_width = max(width, LEFT_MARGIN + RIGHT_MARGIN + 10)
+    width = max(10, width - RIGHT_MARGIN - LEFT_MARGIN)
+    if state is None:
+        state = fetch_pane_state()
+    panes, color_map, grouped, selected_pane_id, unread = state
+
+    lines = []
+    for hline in header_lines(width):
+        lines.append((hline, None, None))
+    lines.append(("", None, None))
+
+    if len(panes) == 0:
+        lines.append((f"{DIM}no active pi panes{RESET}", None, None))
+    else:
+        for session_index, (session, session_panes) in enumerate(grouped.items()):
+
+            session_colour = color_map.get(session)
+            sesh_style = f"\033[38;5;{session_colour}m" if session_colour is not None else CYAN
+            all_frozen = bool(session_panes) and all(pane.is_frozen for pane in session_panes)
+            border_style = FROZEN_BORDER if all_frozen else sesh_style
+            title_style = FROZEN_TEXT if all_frozen else sesh_style
+            title_weight = "" if all_frozen else "\033[1m"
+            inner_width = width - 2  # space between left │ and right │ borders
+            if inner_width < 4:
+                lines.append((session_header_line(session, session_panes, width, color_map), None, None))
+                for pane in session_panes:
+                    is_unread = bool(unread.get(pane.pane_id, False))
+                    is_selected = pane.pane_id == selected_pane_id
+                    bg = tinted_bg(session_colour) if is_selected else None
+                    for row_line in row_lines_for_pane(pane, width, is_unread=is_unread, is_selected=is_selected):
+                        lines.append((fit(row_line, width), pane, bg))
+                continue
+
+            button = SESSION_NEW_BUTTON
+            button_width = len(button)  # Use ASCII cells to keep popup compositing stable.
+            count_str = f"({len(session_panes)})" if len(session_panes) > 1 else ""
+            count_width = 1 + len(count_str) if count_str else 0
+            gap_width = 1 if inner_width >= button_width + 4 else 0
+            button_gap_width = 1 if inner_width >= button_width + 5 else 0
+            trailing_gap_width = 3 if inner_width >= button_width + 7 else button_gap_width
+            if (
+                inner_width
+                - 2
+                - count_width
+                - gap_width
+                - button_gap_width
+                - trailing_gap_width
+                - button_width
+                < 1
+            ):
+                count_str = ""
+                count_width = 0
+            label = truncate(
+                session,
+                max(
+                    1,
+                    inner_width
+                    - 2
+                    - count_width
+                    - gap_width
+                    - button_gap_width
+                    - trailing_gap_width
+                    - button_width,
+                ),
+            )
+            top_parts = [f"{border_style}─ {RESET}", f"{title_weight}{title_style}{label}{RESET}"]
+            if count_str:
+                top_parts.append(f" {DIM}{count_str}{RESET}")
+            used = 2 + len(label) + count_width + gap_width
+            filler_width = max(
+                0,
+                inner_width - used - button_gap_width - button_width - trailing_gap_width,
+            )
+            if gap_width:
+                top_parts.append(" ")
+            if filler_width:
+                top_parts.append(f"{border_style}{'─' * filler_width}{RESET}")
+            if button_gap_width:
+                top_parts.append(" ")
+            top_parts.append(f"{border_style}{button}{RESET}")
+            if trailing_gap_width:
+                top_parts.append(" ")
+                if trailing_gap_width > 1:
+                    top_parts.append(f"{border_style}{'─' * (trailing_gap_width - 1)}{RESET}")
+            top_content = "".join(top_parts)
+            active_pane = next((pane for pane in session_panes if pane.is_current), session_panes[0])
+            button_start = LEFT_MARGIN + 2 + inner_width - trailing_gap_width - button_width
+            button_end = button_start + button_width - 1
+            new_window_target = ("new-window", session, active_pane.path, button_start, button_end)
+            lines.append((f"{border_style}┌{RESET}{top_content}{border_style}┐{RESET}", new_window_target, None))
+
+            for pane in session_panes:
+                is_unread = bool(unread.get(pane.pane_id, False))
+                is_selected = pane.pane_id == selected_pane_id
+                for row_line in row_lines_for_pane(pane, inner_width, is_unread=is_unread, is_selected=is_selected):
+                    row_fitted = fit(row_line, inner_width)
+                    inner = pad_visible(row_fitted, inner_width)
+                    if is_selected:
+                        # Band fills the inner region only. The `│` glyph is
+                        # drawn mid-cell, so tinting the border cell would put
+                        # background on the far side of the line and read as
+                        # overshoot. Ending at the last inner column sits the
+                        # band flush against both borders.
+                        bg = tinted_bg(session_colour)
+                        inner = bg + inner.replace(RESET, RESET + bg) + RESET
+                    lines.append((f"{border_style}│{RESET}{inner}{border_style}│{RESET}", pane, None))
+
+            lines.append((f"{border_style}└{'─' * inner_width}┘{RESET}", None, None))
+
+    footer = []
+    content_lines = [(fit(line, width), target_pane, bg) for line, target_pane, bg in lines]
+    footer_lines = [(fit(line, width), None, None) for line in footer]
+
+    body_height = max(1, height - TOP_MARGIN)
+    footer_height = min(len(footer_lines), body_height)
+    content_height = max(0, body_height - footer_height)
+    clipped = content_lines[:content_height]
+    while len(clipped) < content_height:
+        clipped.append(("", None, None))
+    clipped.extend(footer_lines[-footer_height:])
+    out = [HIDE_CURSOR]
+    # Clear top margin rows
+    for r in range(1, TOP_MARGIN + 1):
+        out.append(f"\033[{r};1H\033[K")
+    pad = " " * LEFT_MARGIN
+    for row, (line, target_pane, bg) in enumerate(clipped, start=1):
+        if isinstance(target_pane, Pane):
+            CLICK_TARGETS[row] = target_pane
+        elif isinstance(target_pane, tuple) and target_pane[0] == "new-window":
+            SESSION_BUTTON_TARGETS[row] = target_pane[1:]
+        if bg:
+            filled = bg + pad + line.replace(RESET, RESET + bg)
+            filled = pad_visible(filled, pane_width)
+            out.append(f"\033[{row + TOP_MARGIN};1H{filled}{RESET}\033[K")
+        else:
+            out.append(f"\033[{row + TOP_MARGIN};1H{pad}{line}{RESET}\033[K")
+    return "".join(out)
+
+
+def collapsed_row_line(pane, width, is_unread, is_selected):
+    """Compact row: session number on the left, status icon on the right."""
+    icon, color, _label = status_icon(pane.display_status)
+    number = str(pane.number or "?")
+    if is_selected:
+        num_style = NUM_SELECTED
+    elif is_unread:
+        num_style = BLUE
+    else:
+        num_style = NUM
+    if width >= 4:
+        number = number.rjust(2)
+    return f"{num_style}{number}{RESET} {color}{icon}{RESET}"
+
+
+def render_collapsed(width, height, state=None):
+    """Narrow handle: expand button, then one numbered row per session.
+
+    Uses the same LEFT_MARGIN/RIGHT_MARGIN insets as the expanded view so the
+    whitespace on each side of the content matches in both modes.
+    """
+    global CLICK_TARGETS, SESSION_BUTTON_TARGETS
+    CLICK_TARGETS = {}
+    SESSION_BUTTON_TARGETS = {}
+    if state is None:
+        state = fetch_pane_state()
+    _panes, color_map, grouped, selected_pane_id, unread = state
+    ordered = [pane for session_panes in grouped.values() for pane in session_panes]
+    inner_width = max(1, width - LEFT_MARGIN - RIGHT_MARGIN)
+    # Expand button right-aligned in the content column, mirroring the
+    # collapse button in the expanded header.
+    button = EXPAND_BUTTON if inner_width >= len(EXPAND_BUTTON) else "»"
+    button_pad = " " * max(0, inner_width - len(button))
+    rows = [
+        (f"{button_pad}{GREEN}{button}{RESET}", None, None),
+        ("", None, None),
+    ]
+    for pane in ordered:
+        is_unread = bool(unread.get(pane.pane_id, False))
+        is_selected = pane.pane_id == selected_pane_id
+        bg = tinted_bg(color_map.get(pane.session)) if is_selected else None
+        rows.append((collapsed_row_line(pane, inner_width, is_unread, is_selected), pane, bg))
+    out = [HIDE_CURSOR]
+    for r in range(1, TOP_MARGIN + 1):
+        out.append(f"\033[{r};1H\033[K")
+    pad = " " * LEFT_MARGIN
+    body_height = max(1, height - TOP_MARGIN)
+    visible = rows[:body_height]
+    for row, (line, target_pane, bg) in enumerate(visible, start=1):
+        if target_pane is not None:
+            CLICK_TARGETS[row] = target_pane
+        if bg:
+            # Highlight spans the full pane width, edge to edge.
+            filled = bg + pad + line.replace(RESET, RESET + bg)
+            filled = pad_visible(filled, width)
+            out.append(f"\033[{row + TOP_MARGIN};1H{filled}{RESET}\033[K")
+        else:
+            out.append(f"\033[{row + TOP_MARGIN};1H{pad}{line}{RESET}\033[K")
+    # Clear leftover rows below the list without a full-screen clear (no flicker).
+    if len(visible) < body_height:
+        out.append(f"\033[{len(visible) + 1 + TOP_MARGIN};1H\033[J")
+    return "".join(out)
+
+
+def render(width, height, state=None):
+    if MODE == "collapsed":
+        return render_collapsed(width, height, state)
+    return render_expanded(width, height, state)
+
+
+def redraw(use_cache=False):
+    global needs_redraw, _pane_state
+    needs_redraw = False
+    try:
+        size = os.get_terminal_size(sys.stdout.fileno())
+        width = max(3 if MODE == "collapsed" else 10, size.columns)
+        height = max(3, size.lines)
+        if not use_cache or _pane_state is None:
+            _pane_state = fetch_pane_state()
+        if MODE == "expanded":
+            frame = render_expanded(width, height, _pane_state)
+        else:
+            frame = render_collapsed(width, height, _pane_state)
+        # Commit the complete sidebar frame atomically. Without this, tmux can
+        # interleave partial sidebar paints with the active pane's cursor mode.
+        sys.stdout.write("\033[?2026h" + frame + "\033[?2026l")
+        sys.stdout.flush()
+    except Exception:
+        pass
+
+
+def sidebar_action():
+    global running
+    running = False
+    action = "expand" if MODE == "collapsed" else "collapse"
+    try:
+        subprocess.Popen(
+            [SIDEBAR_CONTROL, action],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except Exception:
+        pass
+
+
+def live_tmux_client(preferred=""):
+    try:
+        result = subprocess.run(
+            tmux_command("list-clients", "-F", "#{client_name}\t#{client_activity}"),
+            capture_output=True,
+            text=True,
+            timeout=0.5,
+            check=False,
+        )
+        if result.returncode != 0:
+            return ""
+        clients = []
+        for line in result.stdout.splitlines():
+            name, _, activity = line.partition("\t")
+            if not name:
+                continue
+            try:
+                clients.append((name, int(activity or 0)))
+            except ValueError:
+                clients.append((name, 0))
+        names = {name for name, _activity in clients}
+        if preferred and preferred in names:
+            return preferred
+        return max(clients, key=lambda item: item[1], default=("", 0))[0]
+    except Exception:
+        return ""
+
+
+def set_pane_option(pane, key, value):
+    args = tmux_command("set-option", "-p", "-t", pane.pane_id, key, value)
+    try:
+        subprocess.run(
+            args,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=1,
+            check=False,
+        )
+    except Exception:
+        pass
+
+
+def record_pane_interaction(pane):
+    set_pane_option(pane, "@pi_freeze_last_activity", str(int(time.time() * 1000)))
+
+
+
+
+def launch_omp_in_pane(pane_id):
+    def send_command():
+        try:
+            subprocess.run(
+                tmux_command(
+                    "send-keys",
+                    "-t",
+                    pane_id,
+                    "-l",
+                    'omp --cwd "$PWD"; source ~/.config/fish/functions/__omp_resume_once.fish; source ~/.config/fish/functions/__pi_freeze_prompt.fish; __pi_freeze_prompt\r',
+                ),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=1,
+                check=False,
+            )
+        except Exception:
+            pass
+
+    timer = threading.Timer(0.35, send_command)
+    timer.daemon = True
+    timer.start()
+
+
+def create_session_window(session, cwd):
+    try:
+        target_cwd = cwd or os.path.expanduser("~")
+        window_name = os.path.basename(os.path.normpath(target_cwd)) or session
+        if os.path.normpath(target_cwd) == os.path.normpath(os.path.expanduser("~")):
+            window_name = "~"
+        result = subprocess.run(
+            tmux_command(
+                "new-window", "-d", "-P",
+                "-F", "#{session_name}:#{window_index}\t#{pane_id}",
+                "-t", f"{session}:", "-c", target_cwd, "-n", window_name,
+            ),
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+        target, separator, pane_id = result.stdout.strip().partition("\t")
+        if result.returncode != 0 or not separator or not target or not pane_id:
+            return
+        launch_omp_in_pane(pane_id)
+        client = live_tmux_client(os.environ.get("PI_SIDEBAR_CLIENT", ""))
+        if not client:
+            return
+        subprocess.run(
+            tmux_command("switch-client", "-c", client, "-t", session),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=1,
+            check=False,
+        )
+        subprocess.run(
+            tmux_command("select-window", "-t", target),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=1,
+            check=False,
+        )
+    except Exception:
+        pass
+
+
+def sidebar_pid_for_window(pane):
+    try:
+        result = subprocess.run(
+            tmux_command(
+                "list-panes",
+                "-t",
+                f"{pane.session}:{pane.window_index}",
+                "-F",
+                "#{@pi_sidebar_kind}\t#{@pi_sidebar_pid}",
+            ),
+            capture_output=True,
+            text=True,
+            timeout=0.5,
+            check=False,
+        )
+        for line in result.stdout.splitlines():
+            kind, _, pid = line.partition("\t")
+            if kind == SIDEBAR_KIND and pid.isdigit():
+                return int(pid)
+        result = subprocess.run(
+            tmux_command("show-option", "-gqv", "@pi_sidebar_external_pid"),
+            capture_output=True,
+            text=True,
+            timeout=0.5,
+            check=False,
+        )
+        pid = result.stdout.strip()
+        if pid.isdigit():
+            return int(pid)
+    except Exception:
+        pass
+    return None
+
+
+def jump_to_pane(pane, wait=False):
+    if pane is None:
+        return
+    record_pane_interaction(pane)
+    # Frozen panes only receive focus. Their shell prompt waits for Enter.
+    if pane.is_frozen:
+        marker = pane_option(pane, "@pi_freeze_prompt_active")
+        if marker.startswith("waiting:"):
+            try:
+                os.kill(int(marker.split(":", 1)[1]), signal.SIGWINCH)
+            except (OSError, ValueError):
+                pass
+    sidebar_pid = sidebar_pid_for_window(pane)
+    publish_selected_hint(pane.pane_id)
+    if sidebar_pid is not None:
+        try:
+            os.kill(sidebar_pid, signal.SIGUSR1)
+        except OSError:
+            pass
+    client = live_tmux_client(os.environ.get("PI_SIDEBAR_CLIENT", ""))
+    session = shlex.quote(pane.session)
+    window = shlex.quote(f"{pane.session}:{pane.window_index}")
+    pane_id = shlex.quote(pane.pane_id)
+    client_switch = f" -c {shlex.quote(client)}" if client else ""
+    command = f"{TMUX_SHELL} switch-client{client_switch} -t {session}; {TMUX_SHELL} select-window -t {window}; {TMUX_SHELL} select-pane -t {pane_id}; {TMUX_SHELL} refresh-client -S"
+    try:
+        if wait:
+            subprocess.run(
+                ["/bin/sh", "-lc", command],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+                check=False,
+            )
+        else:
+            subprocess.Popen(
+                ["/bin/sh", "-lc", command],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+    except Exception:
+        pass
+
+
+def resolve_jump_target(number):
+    """Prefer the number map the sidebar actually rendered, so a keypress lands
+    on the row the user is looking at. Fall back to live order when no sidebar
+    has published a map yet."""
+    panes = tmux_list_panes()
+    pane_id = load_number_map().get(str(number))
+    if pane_id:
+        for pane in panes:
+            if pane.pane_id == pane_id:
+                return pane
+    ordered = assign_numbers(group_panes(panes))
+    if 1 <= number <= len(ordered):
+        return ordered[number - 1]
+    return None
+
+
+def jump_to_number(number):
+    jump_to_pane(resolve_jump_target(number), wait=True)
+
+
+def _terminal_session_map(pane_ids):
+    """Build {pane_id: (agent, session_file)} from omp/pi terminal-sessions dirs."""
+    result = {}
+    for agent, base in [("omp", "~/.omp/agent/terminal-sessions"),
+                        ("pi", "~/.pi/agent/terminal-sessions")]:
+        base_path = os.path.expanduser(base)
+        try:
+            names = os.listdir(base_path)
+        except OSError:
+            continue
+        for name in names:
+            if not name.startswith("tmux-%"):
+                continue
+            pid = name[5:]
+            if pid not in pane_ids:
+                continue
+            try:
+                with open(os.path.join(base_path, name), "r", encoding="utf-8") as fh:
+                    lines = fh.read().splitlines()
+                    if len(lines) >= 2 and lines[1]:
+                        result[pid] = (agent, lines[1])
+            except OSError:
+                continue
+    return result
+
+
+def snapshot_all_panes():
+    """Lightweight snapshot of all non-sidebar panes for closed-pane tracking."""
+    fmt = "\t".join([
+        "#{pane_id}",
+        "#{session_name}",
+        "#{pane_current_path}",
+        "#{pane_current_command}",
+        "#{pane_title}",
+        "#{@pi_session_name}",
+        "#{@pi_agent_status}",
+        "#{@pi_sidebar_kind}",
+    ])
+    try:
+        result = subprocess.run(
+            tmux_command("list-panes", "-a", "-F", fmt),
+            capture_output=True, text=True, timeout=0.8, check=False,
+        )
+    except Exception:
+        return {}
+    if result.returncode != 0:
+        return {}
+    rows = []
+    for line in result.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) != 8:
+            continue
+        rows.append(parts)
+    ts_map = _terminal_session_map({r[0] for r in rows})
+    snap = {}
+    for pane_id, session, cwd, command, title, pi_name, pi_status, sb_kind in rows:
+        if sb_kind == SIDEBAR_KIND or title == SIDEBAR_TITLE:
+            continue
+        if session.startswith("_"):
+            continue
+        agent, session_file = ts_map.get(pane_id, (None, None))
+        if not agent and (pi_name or pi_status or (title or "").startswith("\u03c0")):
+            agent = "omp"
+        snap[pane_id] = {
+            "cwd": cwd,
+            "command": command,
+            "title": title,
+            "session_name": pi_name or "",
+            "agent": agent,
+            "session_file": session_file,
+            "closed_at": time.time(),
+        }
+    return snap
+
+
+def track_closed_panes():
+    """Diff current panes vs previous snapshot; record disappeared panes."""
+    global _prev_pane_snapshot
+    current = snapshot_all_panes()
+    disappeared = [
+        info for pid, info in _prev_pane_snapshot.items()
+        if pid not in current
+    ]
+    _prev_pane_snapshot = current
+    if not disappeared:
+        return
+    try:
+        with open(CLOSED_PANES_LOCK, "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            try:
+                with open(CLOSED_PANES_FILE, "r", encoding="utf-8") as fh:
+                    stack = json.load(fh)
+            except (OSError, json.JSONDecodeError):
+                stack = []
+            stack.extend(disappeared)
+            if len(stack) > MAX_CLOSED_PANES:
+                stack = stack[-MAX_CLOSED_PANES:]
+            tmp = CLOSED_PANES_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(stack, fh)
+            os.replace(tmp, CLOSED_PANES_FILE)
+    except Exception:
+        pass
+
+
+def restore_last_closed_pane():
+    """Pop the last closed pane from the stack and reopen it."""
+    try:
+        with open(CLOSED_PANES_LOCK, "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            try:
+                with open(CLOSED_PANES_FILE, "r", encoding="utf-8") as fh:
+                    stack = json.load(fh)
+            except (OSError, json.JSONDecodeError):
+                stack = []
+            if not stack:
+                return
+            entry = stack.pop()
+            tmp = CLOSED_PANES_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(stack, fh)
+            os.replace(tmp, CLOSED_PANES_FILE)
+    except Exception:
+        return
+
+    cwd = entry.get("cwd") or os.path.expanduser("~")
+    agent = entry.get("agent")
+    session_file = entry.get("session_file")
+    session_name = entry.get("session_name") or ""
+
+    client = live_tmux_client(os.environ.get("PI_SIDEBAR_CLIENT", ""))
+    try:
+        r = subprocess.run(
+            tmux_command("display-message", "-p", "#{session_name}"),
+            capture_output=True, text=True, timeout=0.5, check=False,
+        )
+        current_session = r.stdout.strip()
+    except Exception:
+        current_session = ""
+    if not current_session or current_session.startswith("_"):
+        return
+
+    win_name = (session_name[:20] if session_name
+                else os.path.basename(os.path.normpath(cwd)) or "shell")
+    try:
+        r = subprocess.run(
+            tmux_command(
+                "new-window", "-d", "-P",
+                "-F", "#{session_name}:#{window_index}\t#{pane_id}",
+                "-t", f"{current_session}:",
+                "-c", cwd, "-n", win_name,
+            ),
+            capture_output=True, text=True, timeout=2, check=False,
+        )
+        target, sep, pane_id = r.stdout.strip().partition("\t")
+        if not sep or not pane_id:
+            return
+    except Exception:
+        return
+
+    if agent in ("omp", "pi"):
+        if agent == "omp":
+            resume_arg = f"--resume {shlex.quote(session_file)}" if session_file else "--continue"
+            cmd = f"omp {resume_arg}"
+        else:
+            resume_arg = f"--resume {shlex.quote(session_file)}" if session_file else "--continue"
+            cmd = f"pi {resume_arg}"
+
+        def _send():
+            try:
+                subprocess.run(
+                    tmux_command("send-keys", "-t", pane_id, "-l", cmd + "\r"),
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    timeout=1, check=False,
+                )
+            except Exception:
+                pass
+        threading.Timer(0.5, _send).start()
+
+    if client:
+        subprocess.run(
+            tmux_command("switch-client", "-c", client, "-t", current_session),
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=1, check=False,
+        )
+    subprocess.run(
+        tmux_command("select-window", "-t", target),
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        timeout=1, check=False,
+    )
+
+
+def collapse_button_hit(x, y, width):
+    if MODE == "collapsed":
+        # Button row only (plus the blank top margin above it). The row below
+        # the button is the gap before session 1, so leave it inert.
+        return y <= 1
+    if y != _collapse_button_row:
+        return False
+    end = width - RIGHT_MARGIN
+    start = max(1, end - len(COLLAPSE_BUTTON) + 1)
+    return start - BUTTON_HIT_SLACK <= x <= end + BUTTON_HIT_SLACK
+
+
+def handle_input(data, width):
+    text = data.decode("utf-8", errors="ignore")
+    # SGR mouse press from terminals/tmux: ESC [ < button ; x ; y M
+    for match in re.finditer(r"\x1b\[<([0-9]+);([0-9]+);([0-9]+)([Mm])", text):
+        button = int(match.group(1))
+        x = int(match.group(2))
+        y = int(match.group(3)) - TOP_MARGIN  # adjust for top margin offset
+        final = match.group(4)
+        if final == "M" and button == 0 and collapse_button_hit(x, y, width):
+            sidebar_action()
+            return
+        if final == "M" and button == 0:
+            session_target = SESSION_BUTTON_TARGETS.get(y)
+            if session_target is not None:
+                session, cwd, start, end = session_target
+                if start <= x <= end:
+                    create_session_window(session, cwd)
+                    return
+        if final == "M" and button == 0:
+            target_pane = CLICK_TARGETS.get(y)
+            if target_pane is not None:
+                jump_to_pane(target_pane)
+                return
+    if MODE == "collapsed" and text in {"\r", "\n", " ", "o", "O", "\x1b"}:
+        sidebar_action()
+    elif MODE == "expanded" and text in {"q", "Q", "x", "X", "\x1b"}:
+        sidebar_action()
+
+
+def poll_input(width):
+    try:
+        fd = sys.stdin.fileno()
+        ready, _, _ = select.select([fd], [], [], 0)
+        if not ready:
+            return
+        data = os.read(fd, 4096)
+        if data:
+            handle_input(data, width)
+    except Exception:
+        pass
+
+
+TAB_SIGNAL_LOCK = "/tmp/pi-sidebar-tab-signal.lock"
+_tab_signal_lock_fh = None
+
+def acquire_tab_signal_lock():
+    """Try to acquire a persistent lock for tab title animation.
+    Only one sidebar process holds this for its entire lifetime."""
+    global _tab_signal_lock_fh
+    try:
+        _tab_signal_lock_fh = open(TAB_SIGNAL_LOCK, "w")
+        fcntl.flock(_tab_signal_lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except (IOError, OSError):
+        if _tab_signal_lock_fh:
+            _tab_signal_lock_fh.close()
+            _tab_signal_lock_fh = None
+        return False
+
+def update_tab_title_signals(panes):
+    """Update @pi_window_signal for each window with a working Pi pane.
+    Only runs if this process holds the persistent tab signal lock."""
+    if _tab_signal_lock_fh is None:
+        return
+    frame = ANIM_FRAMES[anim_frame % len(ANIM_FRAMES)]
+    signal = f"#[fg=#f59e0b]{frame}#[default]"
+    seen_windows = set()
+    for pane in panes:
+        if pane.display_status != "working":
+            continue
+        win = f"{pane.session}:{pane.window_index}"
+        if win in seen_windows:
+            continue
+        seen_windows.add(win)
+        try:
+            subprocess.run(
+                tmux_command("set-option", "-wq", "-t", win, "@pi_window_signal", signal),
+                timeout=0.2, check=False,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            pass
+
+def refresh_pane_state():
+    global _pane_state
+    try:
+        _pane_state = fetch_pane_state()
+    except Exception:
+        pass
+    finally:
+        _fetch_ready.set()
+
+
+def start_pane_refresh():
+    global _fetch_thread
+    if _fetch_thread is not None and _fetch_thread.is_alive():
+        return
+    _fetch_ready.clear()
+    _fetch_thread = threading.Thread(target=refresh_pane_state, daemon=True)
+    _fetch_thread.start()
+
+
+def run_tab_signal_animator():
+    next_frame = time.monotonic()
+    while running:
+        if not _animations_paused:
+            state = _pane_state
+            if state:
+                update_tab_title_signals(state[0])
+        next_frame += ANIM_INTERVAL
+        delay = next_frame - time.monotonic()
+        if delay <= 0:
+            next_frame = time.monotonic()
+            continue
+        time.sleep(delay)
+
+
+
+def main():
+    global needs_redraw, anim_frame
+    signal.signal(signal.SIGTERM, on_signal)
+    signal.signal(signal.SIGINT, on_signal)
+    signal.signal(signal.SIGWINCH, on_winch)
+    signal.signal(signal.SIGUSR1, on_selection_refresh)
+    signal.signal(signal.SIGUSR2, on_animation_focus)
+    is_tab_animator = acquire_tab_signal_lock()
+    stdin_fd = None
+    old_term = None
+    try:
+        if sys.stdin.isatty():
+            stdin_fd = sys.stdin.fileno()
+            old_term = termios.tcgetattr(stdin_fd)
+            tty.setcbreak(stdin_fd)
+        sys.stdout.write(ENABLE_MOUSE)
+        sys.stdout.flush()
+        redraw(use_cache=False)
+        register_sidebar_pid()
+        if is_tab_animator:
+            threading.Thread(target=run_tab_signal_animator, daemon=True).start()
+        next_frame = time.monotonic() + ANIM_INTERVAL
+        next_fetch = time.monotonic() + FETCH_INTERVAL
+        while running:
+            if os.getppid() == 1:
+                break
+
+            if _selection_refresh_requested.is_set():
+                _selection_refresh_requested.clear()
+                refresh_selected_pane()
+                if not _animations_paused:
+                    redraw(use_cache=True)
+
+            now = time.monotonic()
+            if now >= next_fetch:
+                start_pane_refresh()
+                next_fetch += FETCH_INTERVAL
+                if next_fetch <= now:
+                    next_fetch = now + FETCH_INTERVAL
+
+            if _fetch_ready.is_set():
+                _fetch_ready.clear()
+                if not _animations_paused:
+                    redraw(use_cache=True)
+            elif needs_redraw and not _animations_paused:
+                redraw(use_cache=True)
+
+            now = time.monotonic()
+            if now >= next_frame:
+                frame_count = 1 + int((now - next_frame) / ANIM_INTERVAL)
+                advance_animation(frame_count)
+                next_frame += frame_count * ANIM_INTERVAL
+                if not _animations_paused:
+                    redraw(use_cache=True)
+
+            min_width = 3 if MODE == "collapsed" else 10
+            try:
+                width = max(min_width, os.get_terminal_size(sys.stdout.fileno()).columns)
+            except Exception:
+                width = min_width
+            poll_input(width)
+
+            next_deadline = min(next_frame, next_fetch)
+            timeout = max(0.0, next_deadline - time.monotonic())
+            _wake_event.wait(timeout)
+            _wake_event.clear()
+    finally:
+        unregister_sidebar_pid()
+        try:
+            sys.stdout.write(DISABLE_MOUSE + RESET + SHOW_CURSOR + "\033[2J\033[H")
+            sys.stdout.flush()
+        except Exception:
+            pass
+        if stdin_fd is not None and old_term is not None:
+            try:
+                termios.tcsetattr(stdin_fd, termios.TCSADRAIN, old_term)
+            except Exception:
+                pass
+
+
+if __name__ == "__main__":
+    if PLAY_SOUND:
+        import shutil
+        play_status_sound_worker()
+    elif JUMP_NUMBER is not None:
+        jump_to_number(JUMP_NUMBER)
+    elif RESTORE_LAST:
+        restore_last_closed_pane()
+    else:
+        main()

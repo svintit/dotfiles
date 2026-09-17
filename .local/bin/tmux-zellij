@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Compatibility shim.
+# We no longer keep a separate zellij-parity tmux profile.
+# Forward everything to the ghostty tmux entrypoint.
+exec "$HOME/.local/bin/tmux-zellij-ghostty" "$@"

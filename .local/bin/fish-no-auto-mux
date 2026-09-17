@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+export NO_AUTO_MUX=1
+export TMUX_POPUP=1
+exec /opt/homebrew/bin/fish "$@"

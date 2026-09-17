@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROLE=${1:?role required}
+WIDTH=${2:-35}
+CURRENT_PANE=$(tmux display-message -p '#{pane_id}')
+CURRENT_COMMAND=$(tmux display-message -p -t "$CURRENT_PANE" '#{pane_current_command}')
+CURRENT_START_COMMAND=$(tmux display-message -p -t "$CURRENT_PANE" '#{pane_start_command}')
+CURRENT_PID=$(tmux display-message -p -t "$CURRENT_PANE" '#{pane_pid}')
+HORIZONTAL_BEFORE_FLAG=()
+pane_is_pi() {
+  [ "$CURRENT_COMMAND" = "pi" ] && return 0
+  case "$CURRENT_START_COMMAND" in
+    */pi|pi) return 0 ;;
+  esac
+  [ -n "$CURRENT_PID" ] && pgrep -P "$CURRENT_PID" -x pi >/dev/null 2>&1
+}
+if pane_is_pi; then
+  HORIZONTAL_BEFORE_FLAG=(-b)
+fi
+CURRENT_WINDOW=$(tmux display-message -p '#{window_id}')
+CURRENT_WINDOW_NUM=${CURRENT_WINDOW#@}
+CURRENT_CWD=$(tmux display-message -p '#{pane_current_path}')
+SPLIT_ROOT_OPT='@split_root_cwd'
+SOURCE_CWD=$(tmux show-options -p -v -t "$CURRENT_PANE" "$SPLIT_ROOT_OPT" 2>/dev/null || true)
+[ -n "$SOURCE_CWD" ] || SOURCE_CWD="$CURRENT_CWD"
+tmux set-option -p -t "$CURRENT_PANE" "$SPLIT_ROOT_OPT" "$SOURCE_CWD" >/dev/null 2>&1 || true
+TITLE="assistant:${ROLE}"
+HOLDER_SESSION="__assistant_${ROLE}_${CURRENT_WINDOW_NUM}"
+WINDOW_PANE_OPT="@assistant_${ROLE}_pane"
+
+case "$ROLE" in
+  claude)
+    CMD="$HOME/.local/bin/fish-pad 3:1 pi"
+    ;;
+  opencode)
+    CMD="$HOME/.local/bin/fish-pad 3:1 $HOME/.config/ghostty/launch_opencode_in_tmux_pane.sh"
+    ;;
+  *)
+    echo "Unknown assistant role: $ROLE" >&2
+    exit 1
+    ;;
+esac
+
+pane_exists() {
+  local pane=$1
+  [ -n "$pane" ] || return 1
+  tmux display-message -p -t "$pane" '#{pane_id}' >/dev/null 2>&1
+}
+
+first_real_pane() {
+  local pane title
+  for pane in $(tmux list-panes -t "$CURRENT_WINDOW" -F '#{pane_id}'); do
+    title=$(tmux display-message -p -t "$pane" '#{pane_title}' 2>/dev/null || true)
+    if [ "$title" != "$TITLE" ]; then
+      printf '%s\n' "$pane"
+      return 0
+    fi
+  done
+  return 1
+}
+
+ASSISTANT_PANE=$(tmux show-options -w -v -t "$CURRENT_WINDOW" "$WINDOW_PANE_OPT" 2>/dev/null || true)
+
+if ! pane_exists "$ASSISTANT_PANE"; then
+  ASSISTANT_PANE=""
+fi
+
+ASSISTANT_WINDOW=""
+if [ -n "$ASSISTANT_PANE" ]; then
+  ASSISTANT_WINDOW=$(tmux display-message -p -t "$ASSISTANT_PANE" '#{window_id}' 2>/dev/null || true)
+fi
+
+if [ -n "$ASSISTANT_PANE" ] && [ "$ASSISTANT_WINDOW" = "$CURRENT_WINDOW" ]; then
+  FOCUS_PANE=$(first_real_pane || true)
+  [ -n "${FOCUS_PANE:-}" ] && tmux select-pane -t "$FOCUS_PANE"
+  if ! tmux has-session -t "$HOLDER_SESSION" 2>/dev/null; then
+    tmux new-session -d -s "$HOLDER_SESSION" -n "$HOLDER_SESSION" /opt/homebrew/bin/fish
+  fi
+  HOLDER_TARGET=$(tmux list-windows -t "$HOLDER_SESSION" -F '#{session_name}:#{window_index}.1' | head -n 1)
+  tmux join-pane -d -s "$ASSISTANT_PANE" -t "$HOLDER_TARGET"
+  exit 0
+fi
+
+if [ -n "$ASSISTANT_PANE" ]; then
+  tmux join-pane -d -s "$ASSISTANT_PANE" -t "$CURRENT_PANE" "${HORIZONTAL_BEFORE_FLAG[@]}" -h -l "${WIDTH}%"
+  tmux set-option -p -t "$ASSISTANT_PANE" @assistant_role "$ROLE"
+  tmux set-option -p -t "$ASSISTANT_PANE" "$SPLIT_ROOT_OPT" "$SOURCE_CWD" >/dev/null 2>&1 || true
+  tmux select-pane -t "$ASSISTANT_PANE" -T "$TITLE"
+  tmux set-option -w -t "$CURRENT_WINDOW" "$WINDOW_PANE_OPT" "$ASSISTANT_PANE"
+  tmux select-pane -t "$CURRENT_PANE"
+  tmux kill-session -t "$HOLDER_SESSION" 2>/dev/null || true
+  exit 0
+fi
+
+NEW_PANE=$(tmux split-window -d -P -F '#{pane_id}' -t "$CURRENT_PANE" "${HORIZONTAL_BEFORE_FLAG[@]}" -h -l "${WIDTH}%" -c "$SOURCE_CWD" "$CMD")
+tmux set-option -p -t "$NEW_PANE" @assistant_role "$ROLE"
+tmux set-option -p -t "$NEW_PANE" "$SPLIT_ROOT_OPT" "$SOURCE_CWD" >/dev/null 2>&1 || true
+tmux select-pane -t "$NEW_PANE" -T "$TITLE"
+tmux set-option -w -t "$CURRENT_WINDOW" "$WINDOW_PANE_OPT" "$NEW_PANE"
+tmux select-pane -t "$CURRENT_PANE"

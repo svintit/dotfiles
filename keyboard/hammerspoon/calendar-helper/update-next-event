@@ -1,0 +1,54 @@
+#!/bin/sh
+set -eu
+
+output="${DOTFILES_CALENDAR_OUTPUT:-$HOME/.hammerspoon/calendar-helper/next-event.txt}"
+temporary="${output}.tmp"
+calendars="${DOTFILES_CALENDARS:-}"
+ignored_titles="${DOTFILES_CALENDAR_IGNORED_TITLES:-Lunch}"
+ical_buddy="${ICALBUDDY:-$(command -v icalBuddy || true)}"
+
+if [ -z "$ical_buddy" ]; then
+    printf 'icalBuddy is not installed\n' >&2
+    exit 1
+fi
+
+mkdir -p "$(dirname "$output")"
+
+filter_ignored() {
+    if [ -n "$ignored_titles" ]; then
+        grep -Eiv "$ignored_titles" || true
+    else
+        cat
+    fi
+}
+
+run_query() {
+    scope="$1"
+    shift
+    if [ -n "$calendars" ]; then
+        "$ical_buddy" "$@" -ic "$calendars" "$scope"
+    else
+        "$ical_buddy" "$@" "$scope"
+    fi
+}
+
+current=$(run_query eventsNow \
+    -ea -li 3 -nc -npn -nrd \
+    -b '' -ps '#|#' -po 'datetime,title' -iep 'title,datetime' \
+    -tf '%H:%M' -df '%a' | filter_ignored | sed -n '1p')
+
+if [ -n "$current" ]; then
+    printf 'CURRENT|%s\n' "$current" > "$temporary"
+else
+    upcoming=$(run_query eventsToday \
+        -n -ea -li 3 -nc -npn -nrd -eed \
+        -b '' -ps '#|#' -po 'datetime,title' -iep 'title,datetime' \
+        -tf '%H:%M' -df '%a' | filter_ignored | sed -n '1p')
+    if [ -n "$upcoming" ]; then
+        printf 'NEXT|%s\n' "$upcoming" > "$temporary"
+    else
+        printf 'NONE\n' > "$temporary"
+    fi
+fi
+
+mv "$temporary" "$output"

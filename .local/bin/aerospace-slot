@@ -1,0 +1,38 @@
+#!/bin/sh
+# Switch the selected monitor to one of its workspace slots.
+#
+# The selected monitor is explicit. AeroSpace focus can move after an empty
+# workspace opens, but the next slot command still targets the same monitor.
+
+AEROSPACE=/opt/homebrew/bin/aerospace
+SLOTS="$HOME/.hammerspoon/workspace-slots.json"
+SELECTION="$HOME/.hammerspoon/workspace-selected-monitor"
+CONNECTED="$HOME/.hammerspoon/workspace-connected-monitors"
+
+slot="$1"
+[ -n "$slot" ] || exit 0
+[ -f "$SLOTS" ] || exit 0
+
+selected=
+[ -f "$SELECTION" ] && selected="$(cat "$SELECTION")"
+monitor="${selected%%|*}"
+
+if [ -z "$monitor" ] || [ ! -f "$CONNECTED" ] ||
+    ! awk -F'|' -v monitor="$monitor" '$1 == monitor { found=1 } END { exit !found }' "$CONNECTED"; then
+    selected="$($AEROSPACE list-workspaces --focused --format '%{monitor-name}|%{monitor-id}')"
+    monitor="${selected%%|*}"
+    [ -n "$monitor" ] || exit 0
+    printf '%s\n' "$selected" > "$SELECTION.tmp" && mv "$SELECTION.tmp" "$SELECTION"
+fi
+
+workspace="$(jq -r --arg m "$monitor" --argjson i "$slot" '
+    .monitors
+    | to_entries[]
+    | select(.value.name == $m)
+    | .value.slots[$i - 1] // empty
+' "$SLOTS" 2>/dev/null)"
+
+[ -n "$workspace" ] || exit 0
+
+$AEROSPACE workspace "$workspace"
+$AEROSPACE focus-monitor -- "$monitor" >/dev/null 2>&1 &

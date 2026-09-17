@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:${PATH:-}"
+OUTER_SOCKET="${PI_OUTER_TMUX_SOCKET:-pi-shell}"
+OUTER_SESSION="${PI_OUTER_TMUX_SESSION:-pi-shell}"
+OUTER_WINDOW="workspace"
+INNER_SOCKET="${PI_INNER_TMUX_SOCKET:-ghostty-main}"
+INNER_SESSION="${PI_INNER_TMUX_SESSION:-main}"
+CONFIG="$HOME/.config/tmux/pi-sidebar-outer.tmux.conf"
+INNER_CLIENT="$HOME/.local/bin/tmux-pi-sidebar-inner-client"
+SIDEBAR="$HOME/.local/bin/tmux-pi-sidebar"
+CONTROL="$HOME/.local/bin/tmux-pi-sidebar-outer-control"
+OUTER_TMUX_BIN="${OUTER_TMUX_BIN:-/opt/homebrew/bin/tmux}"
+INNER_TMUX_BIN="${INNER_TMUX_BIN:-tmux}"
+if ! command -v "$INNER_TMUX_BIN" >/dev/null 2>&1; then
+  INNER_TMUX_BIN="/opt/homebrew/bin/tmux"
+fi
+
+outer() {
+  env -u TMUX "$OUTER_TMUX_BIN" -L "$OUTER_SOCKET" "$@"
+}
+
+inner() {
+  env -u TMUX "$INNER_TMUX_BIN" -L "$INNER_SOCKET" "$@"
+}
+
+sidebar_command() {
+  local mode=${1:?mode required}
+  if [ "$mode" = "collapsed" ]; then
+    printf '%s --collapsed\n' "$SIDEBAR"
+  else
+    printf '%s\n' "$SIDEBAR"
+  fi
+}
+
+start_sidebar() {
+  local mode=${1:?mode required} inner_pane sidebar_pane inner_tty size command
+  inner_pane=$(outer show-option -wqv -t "$OUTER_SESSION:$OUTER_WINDOW" @pi_outer_inner_pane)
+  sidebar_pane=$(outer show-option -wqv -t "$OUTER_SESSION:$OUTER_WINDOW" @pi_outer_sidebar_pane)
+  inner_tty=$(outer display-message -p -t "$inner_pane" '#{pane_tty}')
+  command=$(sidebar_command "$mode")
+  if [ "$mode" = "collapsed" ]; then
+    size=$COLLAPSED_WIDTH
+  else
+    size=$WIDTH
+  fi
+
+  outer resize-pane -t "$sidebar_pane" -x "$size"
+  outer respawn-pane -k -t "$sidebar_pane" \
+    -e "PI_SIDEBAR_TMUX_SOCKET=$INNER_SOCKET" \
+    -e "PI_SIDEBAR_EXTERNAL=1" \
+    -e "PI_SIDEBAR_CLIENT=$inner_tty" \
+    -e "PI_SIDEBAR_CONTROL=$CONTROL" \
+    "$command"
+  outer set-option -pq -t "$sidebar_pane" @pi_sidebar_kind pi-sidebar
+  outer set-option -wq -t "$OUTER_SESSION:$OUTER_WINDOW" @pi_outer_sidebar_mode "$mode"
+  outer select-pane -t "$inner_pane"
+}
+
+create_outer() {
+  local inner_pane inner_tty sidebar_pane
+  inner has-session -t "$INNER_SESSION" 2>/dev/null || {
+    echo "Inner tmux session is unavailable: $INNER_SOCKET/$INNER_SESSION" >&2
+    exit 1
+  }
+  if outer has-session -t "$OUTER_SESSION" 2>/dev/null; then
+    return 0
+  fi
+
+  outer -f "$CONFIG" new-session -d -s "$OUTER_SESSION" -n "$OUTER_WINDOW" \
+    -e "PI_INNER_TMUX_SOCKET=$INNER_SOCKET" \
+    -e "PI_INNER_TMUX_SESSION=$INNER_SESSION" \
+    "$INNER_CLIENT"
+  inner_pane=$(outer display-message -p -t "$OUTER_SESSION:$OUTER_WINDOW" '#{pane_id}')
+  inner_tty=$(outer display-message -p -t "$inner_pane" '#{pane_tty}')
+  sidebar_pane=$(outer split-window -d -b -h -l "$WIDTH" -t "$inner_pane" \
+    -e "PI_SIDEBAR_TMUX_SOCKET=$INNER_SOCKET" \
+    -e "PI_SIDEBAR_EXTERNAL=1" \
+    -e "PI_SIDEBAR_CLIENT=$inner_tty" \
+    -e "PI_SIDEBAR_CONTROL=$CONTROL" \
+    -P -F '#{pane_id}' "$SIDEBAR")
+  outer set-option -pq -t "$sidebar_pane" @pi_sidebar_kind pi-sidebar
+  outer set-option -wq -t "$OUTER_SESSION:$OUTER_WINDOW" @pi_outer_sidebar_pane "$sidebar_pane"
+  outer set-option -wq -t "$OUTER_SESSION:$OUTER_WINDOW" @pi_outer_inner_pane "$inner_pane"
+  outer set-option -wq -t "$OUTER_SESSION:$OUTER_WINDOW" @pi_outer_sidebar_mode expanded
+  outer select-pane -t "$inner_pane"
+}
+
+cmd=${1:-attach}
+case "$cmd" in
+  create)
+    create_outer
+    ;;
+  attach)
+    create_outer
+    ATOMIC_ATTACH="$HOME/.local/bin/tmux-redraw-atomic"
+    if [ -x "$ATOMIC_ATTACH" ]; then
+      exec env -u TMUX "$ATOMIC_ATTACH" "$OUTER_TMUX_BIN" -L "$OUTER_SOCKET" attach-session -t "$OUTER_SESSION"
+    fi
+    exec env -u TMUX "$OUTER_TMUX_BIN" -L "$OUTER_SOCKET" attach-session -t "$OUTER_SESSION"
+    ;;
+  sidebar)
+    create_outer
+    start_sidebar "${2:-expanded}"
+    ;;
+  status)
+    outer list-panes -t "$OUTER_SESSION:$OUTER_WINDOW" -F '#{pane_id} #{pane_index} #{pane_width}x#{pane_height} #{pane_current_command} #{@pi_sidebar_kind}'
+    ;;
+  kill)
+    outer kill-server 2>/dev/null || true
+    ;;
+  *)
+    echo "Usage: tmux-pi-sidebar-outer [create|attach|sidebar expanded|sidebar collapsed|status|kill]" >&2
+    exit 2
+    ;;
+esac

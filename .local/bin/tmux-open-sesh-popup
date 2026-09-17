@@ -1,0 +1,256 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+CLIENT=${TMUX_TARGET_CLIENT:-$(tmux display-message -p '#{client_tty}')}
+CWD=${TMUX_TARGET_PATH:-$(tmux display-message -p '#{pane_current_path}')}
+MODE=${SESH_TMUX_OPEN_MODE:-menu}
+FZF_OPENER="$HOME/.local/bin/tmux-open-sesh-fzf-popup"
+CACHE_HELPER="$HOME/.local/bin/sesh-tmux-popup"
+PALETTE=(39 45 51 75 81 114 117 150 156 180 186 210 213 215 219 222 33 69 105 111 123 141 147 159 171 177 183 195 201 207 228 229)
+USED_COLOURS=()
+SELECTED_COLOUR=''
+SESSION_LABEL=''
+MIN_COLOUR_DISTANCE_SQUARED=$((140 * 140))
+
+# Easy reset: run `tmux set-environment -g SESH_TMUX_OPEN_MODE fzf` to use the
+# previous fzf popup path, or `tmux set-environment -g SESH_TMUX_OPEN_MODE menu`
+# to return to this native tmux menu.
+if [ "$MODE" = "fzf" ] || [ "${1:-}" = "--fzf" ]; then
+  exec "$FZF_OPENER" "$@"
+fi
+
+if [ "${1:-}" = "--warm" ]; then
+  "$CACHE_HELPER" --warm >/dev/null 2>&1 || true
+  exit 0
+fi
+
+shell_quote() {
+  printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+
+tmux_quote() {
+  shell_quote "$1"
+}
+
+tmux_format_escape() {
+  printf '%s' "$1" | sed 's/#/##/g'
+}
+
+xterm_colour_to_rgb() {
+  local code=$1
+  local offset component
+
+  if [ "$code" -ge 16 ] && [ "$code" -le 231 ]; then
+    offset=$((code - 16))
+    component=$((offset / 36))
+    RGB_R=$([ "$component" -eq 0 ] && printf 0 || printf '%s' $((55 + component * 40)))
+    component=$(((offset / 6) % 6))
+    RGB_G=$([ "$component" -eq 0 ] && printf 0 || printf '%s' $((55 + component * 40)))
+    component=$((offset % 6))
+    RGB_B=$([ "$component" -eq 0 ] && printf 0 || printf '%s' $((55 + component * 40)))
+    return
+  fi
+
+  if [ "$code" -ge 232 ] && [ "$code" -le 255 ]; then
+    RGB_R=$((8 + (code - 232) * 10))
+    RGB_G=$RGB_R
+    RGB_B=$RGB_R
+    return
+  fi
+
+  RGB_R=255
+  RGB_G=255
+  RGB_B=255
+}
+
+colour_is_used() {
+  local candidate=$1
+  local used
+  for used in "${USED_COLOURS[@]}"; do
+    [ "$used" = "$candidate" ] && return 0
+  done
+  return 1
+}
+
+colour_is_too_similar() {
+  local candidate=$1
+  local used=$2
+  local cr cg cb ur ug ub dr dg db distance
+
+  xterm_colour_to_rgb "$candidate"
+  cr=$RGB_R
+  cg=$RGB_G
+  cb=$RGB_B
+
+  xterm_colour_to_rgb "$used"
+  ur=$RGB_R
+  ug=$RGB_G
+  ub=$RGB_B
+
+  dr=$((cr - ur))
+  dg=$((cg - ug))
+  db=$((cb - ub))
+  distance=$((dr * dr + dg * dg + db * db))
+
+  [ "$distance" -lt "$MIN_COLOUR_DISTANCE_SQUARED" ]
+}
+
+colour_is_distinct() {
+  local candidate=$1
+  local used
+
+  colour_is_used "$candidate" && return 1
+
+  for used in "${USED_COLOURS[@]}"; do
+    colour_is_too_similar "$candidate" "$used" && return 1
+  done
+
+  return 0
+}
+
+remember_colour() {
+  USED_COLOURS+=("$1")
+  SELECTED_COLOUR="colour$1"
+}
+
+session_colour() {
+  local h=$1
+  local palette_size=${#PALETTE[@]}
+  local idx=$((h % palette_size))
+  local attempts=0
+  local colour
+
+  while [ "$attempts" -lt "$palette_size" ]; do
+    colour=${PALETTE[$idx]}
+    if colour_is_distinct "$colour"; then
+      remember_colour "$colour"
+      return
+    fi
+    idx=$(((idx + 1) % palette_size))
+    attempts=$((attempts + 1))
+  done
+
+  attempts=0
+  idx=$((h % palette_size))
+  while [ "$attempts" -lt "$palette_size" ]; do
+    colour=${PALETTE[$idx]}
+    if ! colour_is_used "$colour"; then
+      remember_colour "$colour"
+      return
+    fi
+    idx=$(((idx + 1) % palette_size))
+    attempts=$((attempts + 1))
+  done
+
+  colour=16
+  while [ "$colour" -le 231 ]; do
+    if colour_is_distinct "$colour"; then
+      remember_colour "$colour"
+      return
+    fi
+    colour=$((colour + 1))
+  done
+
+  colour=16
+  while [ "$colour" -le 231 ]; do
+    if ! colour_is_used "$colour"; then
+      remember_colour "$colour"
+      return
+    fi
+    colour=$((colour + 1))
+  done
+
+  SELECTED_COLOUR="colour${PALETTE[$((h % palette_size))]}"
+}
+
+session_label() {
+  local session_name=$1
+  local h colour escaped
+  h=$(printf '%s' "$session_name" | cksum | cut -d' ' -f1)
+  session_colour "$h"
+  colour=$SELECTED_COLOUR
+  escaped=$(tmux_format_escape "$session_name")
+  printf -v SESSION_LABEL '#[fg=%s] %s#[default]' "$colour" "$escaped"
+}
+
+menu_command_shell() {
+  local shell_command=$1
+  printf 'run-shell -b %s' "$(tmux_quote "$shell_command")"
+}
+
+session_id_for_name() {
+  local target_name=$1
+  tmux list-sessions -F '#{session_id} #S' 2>/dev/null \
+    | awk -v n="$target_name" 'NF>=2 && substr($0, index($0,$2))==n{print $1; exit}'
+}
+
+session_switch_command() {
+  local session_name=$1
+  local session_id shell_command
+  # Use session ID ($N) instead of name to avoid tmux misparse of % and other
+  # special characters in target strings.
+  session_id=$(session_id_for_name "$session_name")
+  local target
+  if [ -n "$session_id" ]; then
+    target=$session_id
+  else
+    target="=$session_name"
+  fi
+  shell_command="tmux switch-client -c $(shell_quote "$CLIENT") -t $(shell_quote "$target"); tmux refresh-client -S; $(shell_quote "$CACHE_HELPER") --refresh tmux"
+  menu_command_shell "$shell_command"
+}
+
+open_fzf_command() {
+  local shell_command
+  shell_command="TMUX_TARGET_CLIENT=$(shell_quote "$CLIENT") TMUX_TARGET_PATH=$(shell_quote "$CWD") SESH_TMUX_OPEN_MODE=fzf $(shell_quote "$0") --fzf"
+  menu_command_shell "$shell_command"
+}
+
+new_session_command() {
+  # Keep advanced creation behavior in the fzf path for now. This keeps the
+  # native menu focused on the fastest common action: switching sessions.
+  open_fzf_command
+}
+
+keys='123456789abcdefghijklmnopqrstuvwxyz'
+args=(
+  -c "$CLIENT"
+  -T '#[fg=#ffcc66] sesh #[default]'
+  -x C
+  -y C
+  -s 'bg=#0a0c14,fg=#e0e0e0'
+  -S 'fg=#5c5c7a'
+  -H 'bg=#141420,fg=#ffffff,bold'
+)
+
+add_item() {
+  args+=("$1" "$2" "$3")
+}
+
+mapfile -t sessions < <(
+  tmux list-sessions -F '#{session_last_attached} #S' 2>/dev/null \
+    | sort -rn \
+    | sed 's/^[0-9]* //' \
+    | grep -Ev '^(_popup_window_|_sesh_picker_)' \
+    | awk 'NR==1{a=$0;next} NR==2{print;print a;next} {print} END{if(NR==1)print a}'
+)
+
+if [ ${#sessions[@]} -eq 0 ]; then
+  add_item 'No tmux sessions' '' ''
+else
+  i=0
+  for session in "${sessions[@]}"; do
+    [ -n "$session" ] || continue
+    key=${keys:$i:1}
+    [ -n "$key" ] || key=''
+    session_label "$session"
+    add_item "$SESSION_LABEL" "$key" "$(session_switch_command "$session")"
+    i=$((i + 1))
+  done
+fi
+
+add_item '' '' ''
+add_item '#[fg=#5ed47a]+#[default] new session / directories / config...' 'n' "$(new_session_command)"
+add_item '#[fg=#ffcc66]r#[default] refresh cache' 'r' "run-shell -b $(tmux_quote "$CACHE_HELPER --refresh tmux")"
+
+exec tmux display-menu "${args[@]}"

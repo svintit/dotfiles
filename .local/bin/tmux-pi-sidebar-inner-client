@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -u
+
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:${PATH:-}"
+INNER_SOCKET="${PI_INNER_TMUX_SOCKET:-ghostty-main}"
+INNER_SESSION="${PI_INNER_TMUX_SESSION:-main}"
+TMUX_BIN="${TMUX_BIN:-tmux}"
+if ! command -v "$TMUX_BIN" >/dev/null 2>&1; then
+  TMUX_BIN="/opt/homebrew/bin/tmux"
+fi
+
+stty -ixon 2>/dev/null || true
+while true; do
+  env -u TMUX "$TMUX_BIN" -L "$INNER_SOCKET" attach-session -t "$INNER_SESSION"
+  sleep 0.2
+done

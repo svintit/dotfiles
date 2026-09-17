@@ -1,0 +1,438 @@
+/**
+ * Splash Screen Extension for OMP - animated header on startup.
+ *
+ * Adapted from the Pi version: uses setWidget() instead of setHeader()
+ * (which is a no-op in omp), and imports from @earendil-works/* instead of
+ * @mariozechner/*.
+ *
+ * Uses setWidget(placement: "aboveEditor") so the splash renders above
+ * the editor. setEditorComponent wraps the editor to detect the first
+ * keystroke. The animation uses requestComponentRender (matching omp's
+ * WelcomeComponent pattern) to trigger re-renders.
+ */
+
+import type { ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
+import { CustomEditor, VERSION } from "@earendil-works/pi-coding-agent";
+import { truncateToWidth } from "@earendil-works/pi-tui";
+
+// ── Logo ────────────────────────────────────────────────────────────────────
+
+const PI_LOGO = [
+	" ____  _ ",
+	"|  _ \\(_)",
+	"| |_) | |",
+	"|  __/| |",
+	"|_|   |_|",
+];
+
+const LOGO_WIDTH = 9;
+
+// ── Matrix rain characters ──────────────────────────────────────────────────
+
+const MATRIX_CHARS =
+	// Elder Futhark runes
+	"ᚠᚢᚦᚨᚱᚲᚷᚹᚺᚾᛁᛃᛇᛈᛉᛊᛏᛒᛖᛗᛚᛝᛟᛞ" +
+	// Younger Futhark / Anglo-Saxon extras
+	"ᛠᛡᛢᛣᛤᛥᛦᛧᛨᛩᛪ" +
+	// Greek
+	"αβγδεζηθλμξπσφψω" +
+	// Katakana
+	"アイウエオカキクケコサシスセソタチツテトナニヌネノハヒフヘホマミムメモヤユヨラリルレロワヲン" +
+	// CJK radicals / Kanji
+	"丶丿乀乁亅亠冂冖冫凵匚卩厂厶夂宀巛廴彐彡忄扌氵灬爫犭疒癶礻糹纟罒耂艹虍衤覀訁讠貝辶釒钅門阝隹飠饣鬥髟鸟" +
+	// Digits & math
+	"01∞∴∵≈≡⊕⊗⌀" +
+	// Box / block elements
+	"░▒▓█▀▄▌▐╱╲╳" +
+	// Miscellaneous symbols
+	"⟁⟐⟡⟢◈◇◆●○◎◉⬡⬢⏣⎔⌬⍟";
+const randomChar = () => MATRIX_CHARS[Math.floor(Math.random() * MATRIX_CHARS.length)];
+
+// ── Helpers ─────────────────────────────────────────────────────────────────
+
+function center(text: string, width: number): string {
+	const pad = Math.max(0, Math.floor((width - visibleLen(text)) / 2));
+	return " ".repeat(pad) + text;
+}
+
+function visibleLen(s: string): number {
+	return s.replace(/\x1b\[[0-9;]*m/g, "").length;
+}
+
+// ── Rain column state ───────────────────────────────────────────────────────
+
+interface RainDrop {
+	col: number;
+	row: number;
+	speed: number;
+	length: number;
+	chars: string[];
+	age: number;
+}
+
+// ── The header component ────────────────────────────────────────────────────
+
+const ANIM_HEIGHT = 12;
+const EDITOR_FOOTER_RESERVE = 6;
+const TICK_MS = 70;
+const RAIN_FADE_IN_FRAMES = 12;
+const LOGO_APPEAR_FRAME = 16;
+const TAGLINE_START = 36;
+const TAGLINE_SPEED = 2;
+const FADE_OUT_START = 120;
+const FADE_OUT_FRAMES = 30;
+const STOP_FRAME = FADE_OUT_START + FADE_OUT_FRAMES + 2;
+
+class SplashHeader {
+	private theme!: Theme;
+	private requestRender!: () => void;
+	private frame = 0;
+	private tagline = "  shitty coding agent";
+	private taglineTyped = 0;
+	private drops: RainDrop[] = [];
+	private lastWidth = 0;
+	private timer: ReturnType<typeof setInterval> | null = null;
+	private cachedLines: string[] | null = null;
+	private frozen = false;
+	private onDone: (() => void) | null = null;
+	// Pre-themed character caches (avoid calling theme.fg per cell per frame)
+	private dimCache: Record<string, string> = {};
+	private headChars: string[] = [];
+	private logoLines: string[] = [];
+	private themed = false;
+
+	/** Called by the editor wrapper on first keystroke to dismiss the splash */
+	onTypingDetected() {
+		if (!this.frozen) {
+			this.freeze();
+		}
+		this.onDone?.();
+	}
+
+	start(requestRender: () => void, theme: Theme, onDone?: () => void) {
+		this.requestRender = requestRender;
+		this.theme = theme;
+		this.onDone = onDone ?? null;
+		this.initTheme();
+
+		this.timer = setInterval(() => {
+			if (this.frozen) return;
+			this.frame++;
+			this.tick();
+			this.cachedLines = null;
+			this.requestRender();
+
+			if (this.frame >= STOP_FRAME) {
+				this.freeze();
+			}
+		}, TICK_MS);
+	}
+
+	private freeze() {
+		this.frozen = true;
+		if (this.timer) {
+			clearInterval(this.timer);
+			this.timer = null;
+		}
+		this.taglineTyped = this.tagline.length;
+		this.cachedLines = null;
+		this.requestRender();
+		// Keep the final frame visible. The widget is removed only when
+		// the user starts typing (onTypingDetected calls onDone).
+	}
+
+	private initTheme() {
+		if (this.themed) return;
+		this.themed = true;
+		// Pre-theme all matrix characters as dim (avoids theme.fg per cell per frame)
+		for (const char of MATRIX_CHARS) {
+			this.dimCache[char] = this.theme.fg("dim", char);
+		}
+		// Pre-theme a pool of head characters
+		for (let i = 0; i < 30; i++) {
+			this.headChars.push(this.theme.fg("accent", this.theme.bold(randomChar())));
+		}
+		// Pre-theme logo lines
+		this.logoLines = PI_LOGO.map(line => {
+			const parts: string[] = [];
+			for (const ch of line) {
+				parts.push(ch !== " " ? this.theme.fg("accent", this.theme.bold(ch)) : " ");
+			}
+			return parts.join("");
+		});
+	}
+
+	private getHeaderHeight(): number {
+		// Fixed height: rendering the full terminal height (44+ rows) is too
+		// expensive per frame. 10 rows is enough for the rain + logo + tagline.
+		return 10;
+	}
+
+	private ensureDrops(width: number) {
+		if (width !== this.lastWidth) {
+			this.drops = [];
+			this.lastWidth = width;
+		}
+		const density = Math.max(1, Math.floor(width / 2));
+		while (this.drops.length < density) {
+			const length = 4 + Math.floor(Math.random() * 10);
+			this.drops.push({
+				col: Math.floor(Math.random() * width),
+				row: -length - Math.floor(Math.random() * 10),
+				speed: 0.2 + Math.random() * 0.8,
+				length,
+				chars: Array.from({ length }, () => randomChar()),
+				age: 0,
+			});
+		}
+	}
+
+	private tick() {
+		const headerHeight = this.getHeaderHeight();
+		for (const d of this.drops) {
+			d.age++;
+			d.row += d.speed;
+			if (Math.random() < 0.25) {
+				const idx = Math.floor(Math.random() * d.chars.length);
+				d.chars[idx] = randomChar();
+			}
+		}
+		for (const d of this.drops) {
+			if (d.row - d.length >= headerHeight + 2) {
+				d.col = Math.floor(Math.random() * (this.lastWidth || 80));
+				d.length = 4 + Math.floor(Math.random() * 10);
+				d.row = -d.length - Math.floor(Math.random() * 6);
+				d.speed = 0.2 + Math.random() * 0.8;
+				d.chars = Array.from({ length: d.length }, () => randomChar());
+				d.age = 0;
+			}
+		}
+
+		if (this.frame >= TAGLINE_START && this.taglineTyped < this.tagline.length) {
+			if ((this.frame - TAGLINE_START) % TAGLINE_SPEED === 0) {
+				this.taglineTyped++;
+			}
+		}
+	}
+
+	render(width: number): string[] {
+		if (this.cachedLines) return this.cachedLines;
+
+		const headerHeight = this.getHeaderHeight();
+		this.ensureDrops(width);
+
+		const grid: (string | null)[][] = Array.from({ length: headerHeight }, () =>
+			new Array(width).fill(null),
+		);
+
+		const fadeIn = Math.min(1, this.frame / RAIN_FADE_IN_FRAMES);
+		const fadeOut = this.frame >= FADE_OUT_START
+			? Math.max(0, 1 - (this.frame - FADE_OUT_START) / FADE_OUT_FRAMES)
+			: 1;
+		const rainAlpha = fadeIn * fadeOut;
+
+		for (const d of this.drops) {
+			for (let i = 0; i < d.length; i++) {
+				const r = Math.floor(d.row) - i;
+				if (r >= 0 && r < headerHeight && d.col >= 0 && d.col < width) {
+					const isHead = i === 0;
+					const cellAlpha = isHead ? rainAlpha : rainAlpha * Math.max(0, 1 - (i / d.length) * 0.5);
+					if (Math.random() < cellAlpha) {
+						grid[r][d.col] = isHead ? "head" : d.chars[i];
+					}
+				}
+			}
+		}
+
+		const lines: string[] = [];
+		const showLogo = this.frame >= LOGO_APPEAR_FRAME;
+
+		const logoStartRow = Math.max(0, Math.floor((headerHeight - ANIM_HEIGHT) / 2)) + 1;
+
+		const clearPadX = 3;
+		const clearPadY = 1;
+		const logoPad = Math.max(0, Math.floor((width - LOGO_WIDTH) / 2));
+		const clearLeft = logoPad - clearPadX;
+		const clearRight = logoPad + LOGO_WIDTH + clearPadX;
+		const clearTop = logoStartRow - clearPadY;
+		const clearBottom = logoStartRow + PI_LOGO.length + 2 + clearPadY;
+
+	for (let row = 0; row < headerHeight; row++) {
+		const logoLineIdx = row - logoStartRow;
+		const isLogoRow = showLogo && logoLineIdx >= 0 && logoLineIdx < PI_LOGO.length;
+		const isTaglineRow = showLogo && logoLineIdx === PI_LOGO.length + 1;
+		const isVersionRow = showLogo && logoLineIdx === PI_LOGO.length + 2;
+		const inClearZoneY = showLogo && row >= clearTop && row < clearBottom;
+
+		if (isLogoRow) {
+			// Pre-computed logo line placed at logoPad; rain outside the clear zone
+			const left: string[] = [];
+			for (let col = 0; col < clearLeft; col++) {
+				const cell = grid[row][col];
+				if (cell) left.push(this.rainChar(cell));
+				else left.push(" ");
+			}
+			const right: string[] = [];
+			for (let col = clearRight; col < width; col++) {
+				const cell = grid[row][col];
+				if (cell) right.push(this.rainChar(cell));
+				else right.push(" ");
+			}
+			const pad = " ".repeat(Math.max(0, logoPad - clearLeft));
+			const logoLine = this.logoLines[logoLineIdx];
+			const trailPad = " ".repeat(Math.max(0, clearRight - logoPad - LOGO_WIDTH));
+			lines.push(left.join("") + pad + logoLine + trailPad + right.join(""));
+		} else if (isTaglineRow) {
+			const typed = this.tagline.slice(0, this.taglineTyped);
+			const cursor =
+				this.taglineTyped < this.tagline.length && this.frame % 8 < 4 ? "█" : " ";
+			const tagText = this.theme.fg("muted", typed) + (this.frozen ? "" : this.theme.fg("dim", cursor));
+			lines.push(center(tagText, width));
+		} else if (isVersionRow) {
+			const vText = this.theme.fg("dim", `v${VERSION}`);
+			lines.push(center(vText, width));
+		} else if (inClearZoneY) {
+			const left: string[] = [];
+			for (let col = 0; col < clearLeft; col++) {
+				const cell = grid[row][col];
+				if (cell) left.push(this.rainChar(cell));
+				else left.push(" ");
+			}
+			const right: string[] = [];
+			for (let col = clearRight; col < width; col++) {
+				const cell = grid[row][col];
+				if (cell) right.push(this.rainChar(cell));
+				else right.push(" ");
+			}
+			lines.push(left.join("") + " ".repeat(clearRight - clearLeft) + right.join(""));
+		} else {
+			// Pure rain row: only set non-null cells (most cells are null/space)
+			const parts: string[] = new Array(width).fill(" ");
+			for (let col = 0; col < width; col++) {
+				const cell = grid[row][col];
+				if (cell) parts[col] = this.rainChar(cell);
+			}
+			lines.push(parts.join(""));
+		}
+	}
+
+		this.cachedLines = lines;
+		return lines;
+	}
+
+	private rainChar(cell: string | null): string {
+		if (!cell) return " ";
+		if (this.frozen) return " ";
+		if (cell === "head") {
+			return this.headChars[Math.floor(Math.random() * this.headChars.length)];
+		}
+		return this.dimCache[cell] ?? " ";
+	}
+
+	invalidate() {
+		this.cachedLines = null;
+	}
+
+	dispose() {
+		if (this.timer) {
+			clearInterval(this.timer);
+			this.timer = null;
+		}
+	}
+}
+
+// ── Extension entry ─────────────────────────────────────────────────────────
+
+const WIDGET_KEY = "splash-screen";
+
+export default function (pi: ExtensionAPI) {
+	let splash: SplashHeader | null = null;
+
+	pi.on("session_start", async (_event, ctx) => {
+		if (!ctx.hasUI) return;
+
+		const hasConversation = ctx.sessionManager
+			.getEntries()
+			.some((entry: { type?: string }) => entry.type === "message");
+		// omp's SessionStartEvent has no "reason" field (unlike Pi).
+		// Show splash on fresh sessions only (no existing conversation).
+		const shouldShowSplash = !hasConversation;
+		if (!shouldShowSplash) {
+			splash?.dispose();
+			splash = null;
+			ctx.ui.setWidget(WIDGET_KEY, undefined);
+			ctx.ui.setEditorComponent(undefined);
+			return;
+		}
+
+		splash = new SplashHeader();
+
+		// Use setWidget (aboveEditor) instead of setHeader (no-op in omp).
+		// requestComponentRender tells the TUI to re-render this specific
+		// component on each animation tick (matches WelcomeComponent's pattern).
+		ctx.ui.setWidget(
+			WIDGET_KEY,
+			(tui, theme) => {
+				const component = {
+					render(width: number): readonly string[] {
+						return splash!.render(width);
+					},
+					invalidate() {
+						splash!.invalidate();
+					},
+					dispose() {
+						splash!.dispose();
+					},
+				};
+
+				splash!.start(
+					() => tui.requestComponentRender(component),
+					theme,
+					() => {
+						ctx.ui.setWidget(WIDGET_KEY, undefined);
+						ctx.ui.setEditorComponent(undefined);
+					},
+				);
+
+				return component;
+			},
+			{ placement: "aboveEditor" },
+		);
+
+		// Wrap the editor to detect the first keystroke and dismiss the splash
+		ctx.ui.setEditorComponent((tui, theme, keybindings) => {
+			class SplashEditor extends CustomEditor {
+				private notified = false;
+
+				handleInput(data: string): void {
+					if (!this.notified && splash && !splash["frozen"]) {
+						this.notified = true;
+						splash.onTypingDetected();
+					}
+					super.handleInput(data);
+				}
+			}
+			return new SplashEditor(tui, theme, keybindings);
+		});
+	});
+
+	pi.on("session_shutdown", async (_event, ctx) => {
+		splash?.dispose();
+		splash = null;
+		if (ctx.hasUI) {
+			ctx.ui.setWidget(WIDGET_KEY, undefined);
+			ctx.ui.setEditorComponent(undefined);
+		}
+	});
+
+	pi.registerCommand("default-header", {
+		description: "Remove the splash screen widget",
+		handler: async (_args, ctx) => {
+			splash?.dispose();
+			splash = null;
+			ctx.ui.setWidget(WIDGET_KEY, undefined);
+			ctx.ui.setEditorComponent(undefined);
+			ctx.ui.notify("Splash screen removed", "info");
+		},
+	});
+}

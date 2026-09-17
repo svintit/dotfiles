@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+current_session=${TMUX_CONTEXT_SESSION:-$(tmux display-message -p '#{session_name}')}
+client_tty=${TMUX_CONTEXT_TTY:-$(tmux display-message -p '#{client_tty}')}
+window_id=${TMUX_CONTEXT_WINDOW:-$(tmux display-message -p '#{window_id}')}
+window_num=${window_id#@}
+popup_session="_popup_window_${window_num}"
+safe_client=$(printf '%s' "$client_tty" | tr -c 'A-Za-z0-9._-' '_')
+popup_marker="/tmp/tmux-ghostty-popup-open-${safe_client}"
+
+if [[ "$current_session" == _popup_window_* ]]; then
+  exec "$HOME/.local/bin/tmux-close-popup-ghostty"
+fi
+
+if [ -f "$popup_marker" ]; then
+  exec "$HOME/.local/bin/tmux-close-popup-ghostty"
+fi
+
+if tmux has-session -t "$popup_session" 2>/dev/null; then
+  attached=$(tmux display-message -p -t "$popup_session" '#{session_attached}' 2>/dev/null || printf '0')
+  if [ "${attached:-0}" -gt 0 ]; then
+    exec "$HOME/.local/bin/tmux-close-popup-ghostty"
+  fi
+fi
+
+exec "$HOME/.local/bin/tmux-smart-close-ghostty"

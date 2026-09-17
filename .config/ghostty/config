@@ -1,0 +1,137 @@
+# Ghostty is a thin renderer here.
+# One Ghostty surface, tmux owns windows and panes.
+
+font-family = "JetBrainsMono Nerd Font Mono"
+font-family-bold = "JetBrainsMono Nerd Font Mono Bold"
+font-family-italic = "JetBrainsMono Nerd Font Mono Italic"
+font-family-bold-italic = "JetBrainsMono Nerd Font Mono Bold Italic"
+font-size = 14
+adjust-cell-height = 10%
+adjust-cell-width = -10%
+
+background = #0a0c14
+foreground = #e0e0e0
+cursor-color = #ffe4a8
+palette = 0=#4d4d66
+palette = 1=#ffb4c8
+palette = 2=#b4e7b4
+palette = 3=#ffe4a8
+palette = 4=#a8c7fa
+palette = 5=#d4b4f0
+palette = 6=#b4e7e7
+palette = 7=#e0e0e0
+palette = 8=#6c7086
+palette = 9=#ffc8d8
+palette = 10=#c8f0c8
+palette = 11=#fff0c8
+palette = 12=#c8d8ff
+palette = 13=#e4c8f8
+palette = 14=#c8f0f0
+palette = 15=#e4d8ff
+background-opacity = 1.0
+
+window-padding-x = 0
+window-padding-y = 0,0
+window-padding-balance = true
+macos-option-as-alt = true
+focus-follows-mouse = true
+mouse-shift-capture = never
+copy-on-select = false
+confirm-close-surface = false
+macos-titlebar-style = hidden
+window-show-tab-bar = never
+
+cursor-style = bar
+cursor-style-blink = true
+custom-shader = shaders/cursor_warp.glsl
+custom-shader-animation = always
+scrollback-limit = 2000
+command = $HOME/.local/bin/tmux-zellij-ghostty
+
+# tmux-owned tabs/windows
+keybind = cmd+t=text:\x1b[5;30001~
+keybind = cmd+shift+right_bracket=text:\x1b[5;30002~
+keybind = cmd+shift+left_bracket=text:\x1b[5;30003~
+# Alt+N switches tmux tabs. Cmd+N is taken by AeroSpace workspace slots,
+# which intercepts it before Ghostty ever sees the key.
+keybind = alt+digit_1=text:\x1b[5;30004~
+keybind = alt+digit_2=text:\x1b[5;30005~
+keybind = alt+digit_3=text:\x1b[5;30006~
+keybind = alt+digit_4=text:\x1b[5;30007~
+keybind = alt+digit_5=text:\x1b[5;30008~
+keybind = alt+digit_6=text:\x1b[5;30009~
+keybind = alt+digit_7=text:\x1b[5;30010~
+keybind = alt+digit_8=text:\x1b[5;30011~
+keybind = alt+digit_9=text:\x1b[5;30012~
+keybind = cmd+w=text:\x1b[5;30013~
+
+# tmux-owned panes/splits
+keybind = alt+backslash=text:\x1b[5;30014~
+keybind = alt+minus=text:\x1b[5;30015~
+keybind = cmd+ctrl+left=text:\x1b[5;30016~
+keybind = cmd+ctrl+right=text:\x1b[5;30017~
+keybind = cmd+ctrl+up=text:\x1b[5;30018~
+keybind = cmd+ctrl+down=text:\x1b[5;30019~
+keybind = alt+right_bracket=text:\x1b[5;30020~
+keybind = alt+equal=text:\x1b[5;30021~
+keybind = cmd+shift+t=text:\x1b[5;30022~
+keybind = cmd+p=text:\x1b[5;30024~
+keybind = alt+p=text:\x1b[5;30025~
+keybind = cmd+shift+m=text:\x1b[109;4u
+keybind = alt+shift+m=text:\x1b[109;4u
+keybind = §=text:\x1b[5;30026~
+keybind = cmd+shift+equal=text:\x1b[5;30023~
+
+# ctrl+<digit> -> private user-key sequences, the SAME mechanism cmd+digit uses
+# (which works). CSI-u does not: ctrl+1 emits nothing, ctrl+2 = NUL = the tmux
+# C-Space prefix, ctrl+3 = ESC, etc. - all useless. tmux side: user-keys[30..39]
+# -> User30..User39 in pi-sidebar.tmux.conf.
+keybind = ctrl+digit_1=text:\x1b[5;30040~
+keybind = ctrl+1=text:\x1b[5;30040~
+keybind = ctrl+digit_2=text:\x1b[5;30041~
+keybind = ctrl+2=text:\x1b[5;30041~
+keybind = ctrl+digit_3=text:\x1b[5;30042~
+keybind = ctrl+3=text:\x1b[5;30042~
+keybind = ctrl+digit_4=text:\x1b[5;30043~
+keybind = ctrl+4=text:\x1b[5;30043~
+keybind = ctrl+digit_5=text:\x1b[5;30044~
+keybind = ctrl+5=text:\x1b[5;30044~
+keybind = ctrl+digit_6=text:\x1b[5;30045~
+keybind = ctrl+6=text:\x1b[5;30045~
+keybind = ctrl+digit_7=text:\x1b[5;30046~
+keybind = ctrl+7=text:\x1b[5;30046~
+keybind = ctrl+digit_8=text:\x1b[5;30047~
+keybind = ctrl+8=text:\x1b[5;30047~
+keybind = ctrl+digit_9=text:\x1b[5;30048~
+keybind = ctrl+9=text:\x1b[5;30048~
+keybind = ctrl+digit_0=text:\x1b[5;30049~
+keybind = ctrl+0=text:\x1b[5;30049~
+
+# Let tmux see these directly
+keybind = alt+h=unbind
+keybind = alt+j=unbind
+keybind = alt+k=unbind
+keybind = alt+l=unbind
+keybind = alt+x=unbind
+
+# Disable native Ghostty splits so tmux owns panes.
+keybind = cmd+d=ignore
+keybind = cmd+shift+d=text:\x1b[5;30027~
+
+# Native Ghostty behaviors we still want
+keybind = performable:cmd+c=copy_to_clipboard
+keybind = cmd+v=paste_from_clipboard
+keybind = shift+cmd+c=copy_to_clipboard
+keybind = shift+cmd+v=paste_from_clipboard
+keybind = cmd+q=close_surface
+keybind = cmd+equal=increase_font_size:1
+keybind = cmd+minus=decrease_font_size:1
+keybind = cmd+zero=reset_font_size
+keybind = cmd+k=clear_screen
+keybind = cmd+f=toggle_fullscreen
+keybind = cmd+backspace=text:\x15
+keybind = alt+left=text:\x1bb
+keybind = alt+right=csi:1;3C
+keybind = alt+bracket_left=esc:[
+keybind = cmd+enter=ignore
+keybind = cmd+a=ignore

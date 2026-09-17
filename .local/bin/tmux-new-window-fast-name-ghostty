@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+CWD=$(tmux display-message -p '#{pane_current_path}')
+NAME=$(tmux display-message -p '#{b:pane_current_path}')
+SESSION=$(tmux display-message -p '#{session_name}')
+WINDOW_ID=$(tmux new-window -P -F '#{window_id}' -c "$CWD" -n "$NAME")
+
+# Tab titles disabled - uncomment to restore automatic window-name computation.
+  # sleep 0.2
+  # CURRENT_NAME=$(tmux display-message -p -t "$WINDOW_ID" '#{window_name}' 2>/dev/null || printf '%s' "$NAME")
+  # NEXT_NAME=$($HOME/.local/bin/tmux-window-name-ghostty "$WINDOW_ID" "$CURRENT_NAME" 2>/dev/null || printf '%s' "$CURRENT_NAME")
+  # if [ -n "$NEXT_NAME" ] && [ "$NEXT_NAME" != "$CURRENT_NAME" ]; then
+  #   tmux rename-window -t "$WINDOW_ID" "$NEXT_NAME" >/dev/null 2>&1 || true
+  #   tmux refresh-client -S >/dev/null 2>&1 || true
+  # fi
+
+# Auto-launch omp in each new tab, all sessions.
+# --cwd pins omp to the shell's dir; without it omp may relocate to /tmp when
+# the dir is not a project root (e.g. $HOME).
+PANE_ID=$(tmux display-message -p -t "$WINDOW_ID" '#{pane_id}' 2>/dev/null || true)
+if [ -n "$PANE_ID" ]; then
+  (sleep 0.35; tmux send-keys -t "$PANE_ID" -l "omp --cwd \"\$PWD\"; source ~/.config/fish/functions/__omp_resume_once.fish; source ~/.config/fish/functions/__pi_freeze_prompt.fish; __pi_freeze_prompt"$'\r') &
+fi

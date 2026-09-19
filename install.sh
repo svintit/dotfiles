@@ -259,6 +259,14 @@ printf 'home:     %s\n' "$DOTFILES_HOME"
 printf 'dry-run:  %s\n' "$DRY_RUN"
 printf 'platform: %s\n' "$PLATFORM"
 printf '\n'
+if [ -f "$SRC/.gitmodules" ]; then
+    if $DRY_RUN; then
+        printf '[dry-run] git submodule update --init --recursive\n'
+    else
+        git -C "$SRC" submodule update --init --recursive
+    fi
+fi
+
 
 # Get the list of git-tracked files only (never ignored or untracked).
 tracked_files=$(git -C "$SRC" ls-files) || {

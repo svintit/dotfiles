@@ -136,7 +136,7 @@ keyboard/firmware/patches/*
 !keyboard/hammerspoon/
 keyboard/hammerspoon/*
 !keyboard/hammerspoon/init.lua
-!keyboard/hammerspoon/spotify_miniplayer.lua
+!keyboard/hammerspoon/spotify-miniplayer
 !keyboard/hammerspoon/miryoku_cheatsheet.lua
 !keyboard/hammerspoon/miryoku_layers.json
 !keyboard/hammerspoon/requirements.txt

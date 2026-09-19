@@ -1,0 +1,3 @@
+[submodule "keyboard/hammerspoon/spotify-miniplayer"]
+	path = keyboard/hammerspoon/spotify-miniplayer
+	url = https://github.com/svintit/spotify-miniplayer.git

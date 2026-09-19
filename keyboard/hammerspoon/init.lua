@@ -968,7 +968,7 @@ local officeDellDisplayName = "DELL P2723QE"
 
 local screenEdgeInset = 50
 
-_G.spotifyMiniPlayer = require("spotify_miniplayer").start({
+_G.spotifyMiniPlayer = require("spotify-miniplayer.spotify_miniplayer").start({
     preferredScreens = {benqDisplayName, officeDellDisplayName},
     fallbackScreen = builtInDisplayName,
     minWidth = 320,
